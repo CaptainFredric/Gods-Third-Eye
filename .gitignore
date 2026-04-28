@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+
+# Local temporary handoff workspace
+.tmp_gods_eye_zip/
+
+# OS/editor noise
+.DS_Store
+.vscode/*.log
+
+# Optional local archives
+*.zip

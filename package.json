@@ -1,0 +1,24 @@
+{
+  "name": "gods-third-eye",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Real-time 3D global intelligence command center — track live ADS-B aircraft, satellites, maritime routes, and geopolitical incidents on an interactive CesiumJS globe.",
+  "scripts": {
+    "dev": "vite",
+    "start": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "vite build",
+    "presence": "node server/presence.js"
+  },
+  "dependencies": {
+    "@jridgewell/sourcemap-codec": "^1.5.5",
+    "cesium": "^1.124.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "vite": "^6.1.0",
+    "vite-plugin-cesium": "^1.2.23"
+  }
+}

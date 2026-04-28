@@ -1,0 +1,62 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "noop",
+			"type": "shell",
+			"command": "true"
+		},
+		{
+			"label": "Install and build Panopticon Earth",
+			"type": "shell",
+			"command": "npm install && npm run build",
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build Panopticon Earth now",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build Panopticon Earth final",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "Build Panopticon Earth final pass",
+			"type": "shell",
+			"command": "npm",
+			"args": [
+				"run",
+				"build"
+			],
+			"isBackground": false,
+			"group": "build"
+		},
+		{
+			"label": "noop current",
+			"type": "shell",
+			"command": "true",
+			"isBackground": false
+		},
+		{
+			"label": "noop-again",
+			"type": "shell",
+			"command": "true",
+			"isBackground": false
+		}
+	]
+}
