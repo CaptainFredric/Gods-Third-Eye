@@ -2,19 +2,19 @@
 	"version": "2.0.0",
 	"tasks": [
 		{
-			"label": "noop",
+			"label": "Noop",
 			"type": "shell",
 			"command": "true"
 		},
 		{
-			"label": "Install and build Panopticon Earth",
+			"label": "Install and build God's Third Eye",
 			"type": "shell",
 			"command": "npm install && npm run build",
 			"isBackground": false,
 			"group": "build"
 		},
 		{
-			"label": "Build Panopticon Earth now",
+			"label": "Build God's Third Eye",
 			"type": "shell",
 			"command": "npm",
 			"args": [
@@ -25,38 +25,34 @@
 			"group": "build"
 		},
 		{
-			"label": "Build Panopticon Earth final",
+			"label": "Run God's Third Eye dev server",
 			"type": "shell",
 			"command": "npm",
 			"args": [
 				"run",
-				"build"
+				"dev"
 			],
-			"isBackground": false,
-			"group": "build"
+			"isBackground": true
 		},
 		{
-			"label": "Build Panopticon Earth final pass",
+			"label": "Preview God's Third Eye",
 			"type": "shell",
 			"command": "npm",
 			"args": [
 				"run",
-				"build"
+				"preview"
 			],
-			"isBackground": false,
-			"group": "build"
+			"isBackground": true
 		},
 		{
-			"label": "noop current",
+			"label": "Run presence server",
 			"type": "shell",
-			"command": "true",
-			"isBackground": false
-		},
-		{
-			"label": "noop-again",
-			"type": "shell",
-			"command": "true",
-			"isBackground": false
+			"command": "npm",
+			"args": [
+				"run",
+				"presence"
+			],
+			"isBackground": true
 		}
 	]
 }
