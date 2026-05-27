@@ -23,12 +23,26 @@ let _sendTimer = null;
 let _reconnectTimer = null;
 let _desiredName = null;
 let _connected = false;
+let _status = "idle";
 
 /** @type {Map<string, { name: string, lng: number, lat: number, alt: number, heading: number, color: string, lastSeen: number }>} */
 const _peers = new Map();
 
 /** Callbacks registered via onPeersChanged */
 const _listeners = [];
+const _statusListeners = [];
+
+function notifyStatusListeners() {
+  for (const fn of _statusListeners) {
+    try { fn(_status); } catch { /* */ }
+  }
+}
+
+function setStatus(status) {
+  if (_status === status) return;
+  _status = status;
+  notifyStatusListeners();
+}
 
 function wsUrl() {
   // Allow the URL to be overridden via localStorage for deployment flexibility
@@ -41,6 +55,7 @@ function wsUrl() {
 
 function connect() {
   if (_ws) return;
+  setStatus("connecting");
   try {
     _ws = new WebSocket(wsUrl());
   } catch {
@@ -50,6 +65,7 @@ function connect() {
 
   _ws.onopen = () => {
     _connected = true;
+    setStatus("connected");
     if (_desiredName) {
       send({ type: "join", name: _desiredName });
     }
@@ -100,10 +116,16 @@ function connect() {
 function cleanup() {
   _ws = null;
   _connected = false;
+  _myId = null;
+  if (_peers.size) {
+    _peers.clear();
+    notifyListeners();
+  }
 }
 
 function scheduleReconnect() {
   if (_reconnectTimer) return;
+  setStatus("reconnecting");
   _reconnectTimer = window.setTimeout(() => {
     _reconnectTimer = null;
     connect();
@@ -184,12 +206,20 @@ export function onPeersChanged(fn) {
   if (typeof fn === "function") _listeners.push(fn);
 }
 
+export function onPresenceStatusChanged(fn) {
+  if (typeof fn === "function") _statusListeners.push(fn);
+}
+
 /**
  * Check whether the client is currently connected.
  * @returns {boolean}
  */
 export function isPresenceConnected() {
   return _connected;
+}
+
+export function getPresenceStatus() {
+  return _status;
 }
 
 /**

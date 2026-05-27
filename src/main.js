@@ -1,7 +1,7 @@
 import { BASEMAPS, DEFAULT_BOOKMARKS, FX_MODES, LAYERS, SCENARIO, STORAGE_KEYS, INCIDENT_POOL } from "./data/scenario.js";
 import { fetchLiveFeeds, fetchAisFeed, getConfiguredAisEndpoint, setConfiguredAisEndpoint } from "./services/live-feeds.js";
 import { NEWS_CATEGORIES, fetchNewsCategory, fetchAllNewsCategories, invalidateNewsCache } from "./services/news-feeds.js";
-import { initPresence, setPresenceName, getPresencePeers, onPeersChanged, isPresenceConnected } from "./services/presence.js";
+import { initPresence, setPresenceName, getPresencePeers, onPeersChanged, onPresenceStatusChanged, getPresenceStatus } from "./services/presence.js";
 import { initAudioEngine, sfx, setAudioEnabled, isAudioEnabled } from "./services/audio-engine.js";
 
 const Cesium = await loadCesium();
@@ -40,7 +40,7 @@ const BOOT_STEPS = [
   { pct: 74, msg: "Populating global incident pool — 30 hotspot zones…" },
   { pct: 85, msg: "Assembling HUD — 6 data layers · 8 broadcast channels…" },
   { pct: 95, msg: "Calibrating geopolitical overlays…" },
-  { pct:100, msg: "● PANOPTICON EARTH ONLINE — ALL FEEDS ACTIVE" },
+  { pct:100, msg: "● PANOPTICON EARTH ONLINE — SIGNAL SHELL READY" },
 ];
 
 let _incidentCycleTimer = null;
@@ -156,6 +156,8 @@ const state = {
   narrativeTimer:        null,
   newsOpen:              false,
   newsCategory:          "war",
+  newsStatus:            "idle",
+  newsStatusMessage:     "Awaiting first GDELT sync",
   newsArticles:          [],
   newsTickerPool:        [],
   newsTickerIndex:       0,
@@ -1131,6 +1133,32 @@ setTimeout(() => {
   });
 }, 500);
 
+let _issStatus = "idle";
+let _issStatusMessage = "ISS layer off.";
+const OP_CALLSIGN_KEY = "ge-operator-callsign";
+const OP_STREAK_KEY = "ge-visit-streak";
+const OP_LAST_KEY = "ge-last-visit-date";
+
+function defaultIssStatusMessage(status) {
+  switch (status) {
+    case "live":
+      return "Live orbital telemetry locked.";
+    case "loading":
+      return "Syncing ISS orbital telemetry.";
+    case "error":
+      return "ISS orbital telemetry unreachable right now.";
+    case "idle":
+    default:
+      return state.layers.iss ? "ISS telemetry standing by." : "ISS layer off.";
+  }
+}
+
+function setIssStatus(status, message = defaultIssStatusMessage(status)) {
+  _issStatus = status;
+  _issStatusMessage = message;
+  updateSignalIndicators();
+}
+
 cacheElements();
 startBootIntro();
 initializeNarrativeState();
@@ -1367,6 +1395,9 @@ function cacheElements() {
     missionGuideNext:    document.getElementById("mission-guide-next"),
     liveNewsHeadline:    document.getElementById("live-news-headline"),
     newsBriefing:        document.getElementById("news-briefing"),
+    newsLiveDot:         document.getElementById("news-live-dot"),
+    newsTitle:           document.getElementById("news-title"),
+    newsLiveBadge:       document.getElementById("news-live-badge"),
     newsCards:           document.getElementById("news-cards"),
     newsCatNav:          document.getElementById("news-cat-nav"),
     newsUpdated:         document.getElementById("news-updated"),
@@ -1380,7 +1411,8 @@ function cacheElements() {
     throughputValue:     document.getElementById("throughput-value"),
     sigAdsb:             document.getElementById("sig-adsb"),
     sigNews:             document.getElementById("sig-news"),
-    sigAis:              document.getElementById("sig-ais")
+    sigAis:              document.getElementById("sig-ais"),
+    sigIss:              document.getElementById("sig-iss")
   });
 
   if (elements.fxIntensity)    elements.fxIntensity.value   = String(state.fxIntensity);
@@ -1413,7 +1445,6 @@ function createDefaultPanelState() {
   const defaults = {
     "panel-layers": { hidden: false, minimized: false },
     "panel-right": { hidden: false, minimized: true },
-    "floating-summary": { hidden: false, minimized: true },
     "map-legend": { hidden: true, minimized: true }
   };
   return Object.fromEntries(PANEL_IDS.map(id => [id, defaults[id] ?? { hidden: false, minimized: false }]));
@@ -1882,6 +1913,116 @@ function updateMetricCard(key, value, foot) {
   updateSparkline(key, typeof value === "number" ? value : parseInt(value, 10) || 0);
 }
 
+function formatFeedStatusLabel(status) {
+  switch (status) {
+    case "live":
+      return "LIVE";
+    case "loading":
+      return "SYNCING";
+    case "error":
+      return "DEGRADED";
+    case "config-required":
+      return "SETUP REQUIRED";
+    case "idle":
+      return "STANDBY";
+    default:
+      return String(status ?? "unknown").replace(/-/g, " ").toUpperCase();
+  }
+}
+
+function formatFeedUpdatedTime(updatedAt) {
+  if (!updatedAt) return "Not yet refreshed";
+  return new Date(updatedAt).toLocaleTimeString([], {
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: "UTC"
+  }) + " UTC";
+}
+
+function describeFeedCondition(feed) {
+  switch (feed.status) {
+    case "live":
+      return `${feed.source} is live.`;
+    case "loading":
+      return `${feed.source} is syncing now.`;
+    case "error":
+      return `${feed.source} is degraded in this browser right now.`;
+    case "config-required":
+      return `${feed.source} is standing by until an endpoint is configured.`;
+    case "idle":
+      return `${feed.source} is standing by for the next refresh.`;
+    default:
+      return `${feed.source} status is ${String(feed.status ?? "unknown").replace(/-/g, " ")}.`;
+  }
+}
+
+function buildFeedHintText() {
+  const adsb = state.liveFeeds.adsb;
+  const ais = state.liveFeeds.ais;
+
+  if (adsb.status === "error" && ais.status === "config-required") {
+    return "OpenSky ADS-B is degraded in this browser right now. Add a CORS-safe AIS JSON endpoint to enable maritime ingest.";
+  }
+  if (adsb.status === "error" && ais.status === "error") {
+    return "Both aircraft and maritime live feeds are degraded right now. Refresh later or verify network and CORS access for the configured sources.";
+  }
+  if (adsb.status === "live" && ais.status === "config-required") {
+    return "OpenSky ADS-B is live. Add a CORS-safe AIS JSON endpoint to enable maritime vessel ingestion.";
+  }
+  if (adsb.status === "live" && ais.status === "error") {
+    return "OpenSky ADS-B is live. AIS ingest is degraded; verify the configured endpoint is reachable from this browser.";
+  }
+  if (adsb.status === "live" && ais.status === "live") {
+    return "Aircraft and maritime live feeds are both ingesting successfully.";
+  }
+  if (adsb.status === "loading" || ais.status === "loading") {
+    return "Signal ingest is syncing. Feed messaging will update as each source responds.";
+  }
+  return "ADS-B aircraft data comes from OpenSky Network. AIS maritime tracking requires a CORS-safe JSON endpoint or proxy.";
+}
+
+function getLiveFeedModeLabel() {
+  const feeds = [state.liveFeeds.adsb, state.liveFeeds.ais];
+  const liveCount = feeds.filter(feed => feed.status === "live").length;
+
+  if (liveCount === feeds.length) return "LIVE FEED";
+  if (liveCount > 0) return "PARTIAL FEED";
+  if (feeds.some(feed => feed.status === "error")) return "DEGRADED FEED";
+  if (feeds.some(feed => feed.status === "loading")) return "SYNCING FEED";
+  if (feeds.some(feed => feed.status === "config-required")) return "STAGED FEED";
+  return "STANDBY FEED";
+}
+
+function getLiveFeedMetricFoot() {
+  const feeds = [state.liveFeeds.adsb, state.liveFeeds.ais];
+  const liveCount = feeds.filter(feed => feed.status === "live").length;
+
+  if (liveCount === feeds.length) return "All sources live";
+  if (liveCount > 0) return "Partial live";
+  if (feeds.some(feed => feed.status === "error")) return "Feeds degraded";
+  if (feeds.some(feed => feed.status === "loading")) return "Feeds syncing";
+  if (feeds.some(feed => feed.status === "config-required")) return "Setup required";
+  return "Feeds standing by";
+}
+
+function getLiveFeedStateLabel() {
+  return getLiveFeedModeLabel().replace(/ FEED$/, "");
+}
+
+function getClassificationBarStatusText() {
+  return `FEED STATUS: ${getLiveFeedStateLabel()}`;
+}
+
+function getStoredOperatorCallsign() {
+  try {
+    return localStorage.getItem("ge-operator-callsign") || "";
+  } catch {
+    return "";
+  }
+}
+
 function renderFeedStatus() {
   if (!elements.feedStatus) return;
   const feeds = [state.liveFeeds.adsb, state.liveFeeds.ais];
@@ -1889,12 +2030,18 @@ function renderFeedStatus() {
     <article class="feed-card ${feed.status}">
       <div class="feed-card-head">
         <strong>${feed.source}</strong>
-        <span>${feed.status.toUpperCase()}</span>
+        <span>${formatFeedStatusLabel(feed.status)}</span>
       </div>
       <p>${feed.message}</p>
-      <small>${feed.updatedAt ? new Date(feed.updatedAt).toLocaleTimeString([], { hour12: false }) : "Not yet refreshed"}</small>
+      <small>${formatFeedUpdatedTime(feed.updatedAt)}</small>
     </article>
   `).join("");
+
+  if (elements.feedHint) {
+    elements.feedHint.textContent = buildFeedHintText();
+  }
+
+  updateClassificationBar(getStoredOperatorCallsign());
 }
 
 function renderTrustIndicators() {
@@ -1911,8 +2058,8 @@ function renderTrustIndicators() {
   const refreshStatus = state.nextRefreshAt ? "active" : "pending";
 
   const indicators = [
-    { label: "ADS-B",     value: state.liveFeeds.adsb.status.toUpperCase(), status: adsbStatus },
-    { label: "AIS",       value: state.liveFeeds.ais.status.toUpperCase(),  status: aisStatus },
+    { label: "ADS-B",     value: formatFeedStatusLabel(state.liveFeeds.adsb.status), status: adsbStatus },
+    { label: "AIS",       value: formatFeedStatusLabel(state.liveFeeds.ais.status),  status: aisStatus },
     { label: "UTC Sync",  value: "LOCKED", status: "verified" },
     { label: "Refresh",   value: `${state.refreshIntervalSec}s`, status: refreshStatus }
   ];
@@ -1924,7 +2071,7 @@ function renderTrustIndicators() {
   if (!elements.trustSummary) return;
   const liveCount = [state.liveFeeds.adsb, state.liveFeeds.ais].filter(feed => feed.status === "live").length;
   const confidence = liveCount === 2 ? "High" : liveCount === 1 ? "Moderate" : "Limited";
-  elements.trustSummary.textContent = `Source confidence: ${confidence}. Geospatial index and UTC sync are active.`;
+  elements.trustSummary.textContent = `Source confidence: ${confidence}. ${describeFeedCondition(state.liveFeeds.adsb)} ${describeFeedCondition(state.liveFeeds.ais)} Geospatial index and UTC sync remain active.`;
 }
 
 function renderLegend() {
@@ -3453,15 +3600,15 @@ function updateLiveMetrics() {
   updateMetricCard("tracks", visibleTraffic, `${Math.max(1, Math.round(visibleTraffic * 0.35))} sectors monitored`);
   updateMetricCard("alerts", activeAlerts,   activeAlerts ? "Active disruptions" : "No disruptions");
   updateMetricCard("orbits", visibleOrbits,  "Overhead coverage");
-  updateMetricCard("feeds",  liveFeeds,      liveFeeds === 2 ? "All sources live" : liveFeeds === 1 ? "Partial live" : "Feeds loading");
+  updateMetricCard("feeds",  liveFeeds,      getLiveFeedMetricFoot());
 
   if (elements.hudTrackCount) elements.hudTrackCount.textContent = `${visibleTraffic} tracks`;
   if (elements.hudAlertCount) elements.hudAlertCount.textContent = `${activeAlerts} alerts`;
-  if (elements.hudStatusText) elements.hudStatusText.textContent = "LIVE";
-  if (elements.liveRegionLabel) elements.liveRegionLabel.textContent = "Global Intelligence Active";
-  if (elements.hudStatusMode) elements.hudStatusMode.textContent = "LIVE FEED";
+  if (elements.hudStatusText) elements.hudStatusText.textContent = getLiveFeedStateLabel();
+  if (elements.liveRegionLabel) elements.liveRegionLabel.textContent = `Global Intelligence · ${getLiveFeedStateLabel()}`;
+  if (elements.hudStatusMode) elements.hudStatusMode.textContent = getLiveFeedModeLabel();
 
-  if (elements.summaryStage) elements.summaryStage.textContent = "LIVE";
+  if (elements.summaryStage) elements.summaryStage.textContent = getLiveFeedStateLabel();
   if (elements.summaryCopy) {
     const adsbMsg = state.liveFeeds.adsb.status === "live"
       ? `${state.liveFeeds.adsb.records.length} aircraft` : "ADS-B pending";
@@ -3674,7 +3821,10 @@ function openMobileDrawer(drawer) {
       ? "panel-right"
       : null;
 
-  if (panelId) setPanelHidden(panelId, false);
+  if (panelId) {
+    setPanelHidden(panelId, false);
+    if (window.innerWidth <= 980) setPanelMinimized(panelId, false);
+  }
   if (window.innerWidth <= 980) {
     closeIntelSheet();
     closeNewsPanel();
@@ -3759,9 +3909,9 @@ async function refreshLiveFeeds() {
     }
   }
   refreshEntityVisibility();
-  const now = new Date().toLocaleTimeString([], { hour12: false });
-  if (elements.liveLastRefresh) elements.liveLastRefresh.textContent = `Last refresh: ${now} UTC`;
-  if (elements.hudStatusMode)   elements.hudStatusMode.textContent   = "LIVE FEED";
+  const now = formatFeedUpdatedTime(Date.now());
+  if (elements.liveLastRefresh) elements.liveLastRefresh.textContent = `Last refresh: ${now}`;
+  if (elements.hudStatusMode)   elements.hudStatusMode.textContent   = getLiveFeedModeLabel();
   state.nextRefreshAt = Date.now() + state.refreshIntervalSec * 1000;
   state._lastRefreshTime = Date.now();
   updateRefreshCountdown();
@@ -4391,7 +4541,7 @@ function startBootIntro() {
     "[NET] OpenSky ADS-B uplink .......... LIVE",
     "[GEO] CesiumJS WebGL renderer ....... OK",
     "[INT] GDELT 2.0 news pipeline ....... LIVE",
-    "[SAT] ISS orbital telemetry ......... LIVE",
+    "[SAT] ISS orbital telemetry ......... SYNC",
     "[SES] USGS seismic feed (M2.5+) ..... LIVE",
     "[AIS] Maritime AIS decoder .......... STANDBY",
     "[INC] Incident pool (30 zones) ...... ARMED",
@@ -4479,7 +4629,7 @@ function finishBoot({ immediate = false } = {}) {
   };
 
   if (immediate) {
-    finishOverlay();
+    Promise.resolve().then(finishOverlay);
     return;
   }
 
@@ -4590,7 +4740,8 @@ function initHeaderToggle() {
   if (!btn || !hudTop) return;
 
   const STORAGE_KEY_HDR = "panopticon-hdr-collapsed";
-  let collapsed = localStorage.getItem(STORAGE_KEY_HDR) === "1";
+  const prefersCollapsedHeader = () => window.innerWidth > 980 && localStorage.getItem(STORAGE_KEY_HDR) === "1";
+  let collapsed = prefersCollapsedHeader();
 
   function apply(animate) {
     document.body.classList.toggle("header-collapsed", collapsed);
@@ -4611,14 +4762,28 @@ function initHeaderToggle() {
 
   btn.addEventListener("click", () => {
     collapsed = !collapsed;
-    localStorage.setItem(STORAGE_KEY_HDR, collapsed ? "1" : "0");
+    if (window.innerWidth > 980) localStorage.setItem(STORAGE_KEY_HDR, collapsed ? "1" : "0");
+    else localStorage.removeItem(STORAGE_KEY_HDR);
     apply(true);
     if (typeof sfx !== "undefined") sfx.click();
   });
 
   // Reposition after transitions and on resize
   hudTop.addEventListener("transitionend", positionBtn);
-  window.addEventListener("resize", positionBtn);
+  window.addEventListener("resize", () => {
+    const nextCollapsed = prefersCollapsedHeader();
+    if (window.innerWidth <= 980 && collapsed) {
+      collapsed = false;
+      apply(true);
+      return;
+    }
+    if (window.innerWidth > 980 && collapsed !== nextCollapsed) {
+      collapsed = nextCollapsed;
+      apply(false);
+      return;
+    }
+    positionBtn();
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5093,10 +5258,18 @@ function initTerminalCli() {
       case "/iss": {
         if (_issLastData) {
           const d = _issLastData;
-          appendOutput(`ISS: ${d.latitude.toFixed(3)}°N  ${d.longitude.toFixed(3)}°E  Alt: ${Math.round(d.altitude)}km  Vel: ${Math.round(d.velocity)}km/h`, "cmd-ok");
+          const stale = _issStatus === "error";
+          appendOutput(`ISS${stale ? " (stale)" : ""}: ${d.latitude.toFixed(3)}°N  ${d.longitude.toFixed(3)}°E  Alt: ${Math.round(d.altitude)}km  Vel: ${Math.round(d.velocity)}km/h`, stale ? "cmd-warn" : "cmd-ok");
+          if (stale && _issStatusMessage) appendOutput(`Orbital telemetry degraded: ${_issStatusMessage}`, "cmd-warn");
           viewer.camera.flyTo({ destination: Cesium.Cartesian3.fromDegrees(d.longitude, d.latitude, 3000000), duration: 2.5 });
+        } else if (!state.layers.iss) {
+          appendOutput("ISS telemetry is offline — enable the ISS layer first", "cmd-err");
+        } else if (_issStatus === "loading") {
+          appendOutput("ISS telemetry is syncing — try again in a moment", "cmd-warn");
+        } else if (_issStatus === "error") {
+          appendOutput(`ISS telemetry unavailable: ${_issStatusMessage}`, "cmd-err");
         } else {
-          appendOutput("ISS data not yet loaded — enable the ISS layer first", "cmd-err");
+          appendOutput("ISS telemetry is standing by", "cmd-err");
         }
         break;
       }
@@ -5883,7 +6056,7 @@ function applyRegionalContext(label, lng, lat) {
     elements.liveRegionLabel.textContent = `${label.toUpperCase()} · ${nearbyTracks} tracks · ${nearbyAlerts} alerts`;
   }
   if (elements.hudStatusMode) {
-    elements.hudStatusMode.textContent = nearby.length ? "REGION FOCUS" : "LIVE FEED";
+    elements.hudStatusMode.textContent = nearby.length ? "REGION FOCUS" : getLiveFeedModeLabel();
   }
   if (elements.summaryCopy) {
     if (!nearby.length) {
@@ -6318,8 +6491,8 @@ function registerEvents() {
     state.regionFocus = null;
     state.selectedEntity = null;
     if (elements.searchMeta) elements.searchMeta.textContent = "Search a place, alert, route, or saved view.";
-    if (elements.hudStatusMode) elements.hudStatusMode.textContent = "LIVE FEED";
-    if (elements.liveRegionLabel) elements.liveRegionLabel.textContent = "Global Intelligence Active";
+    if (elements.hudStatusMode) elements.hudStatusMode.textContent = getLiveFeedModeLabel();
+    if (elements.liveRegionLabel) elements.liveRegionLabel.textContent = `Global Intelligence · ${getLiveFeedStateLabel()}`;
     closeIntelSheet();
     flyToDestination({
       lng: SCENARIO.initialView.lng,
@@ -6650,6 +6823,7 @@ function initNewsPanel() {
   // Build category pills
   const nav = elements.newsCatNav;
   if (!nav) return;
+  updateNewsFeedChrome();
   nav.innerHTML = "";
   NEWS_CATEGORIES.forEach(cat => {
     const btn = document.createElement("button");
@@ -6769,7 +6943,90 @@ function updateCatPillSelection(catId) {
   });
 }
 
+function setNewsStatus(status, message = "") {
+  state.newsStatus = status;
+  state.newsStatusMessage = message;
+  updateNewsFeedChrome();
+}
+
+function formatNewsFeedError(message) {
+  const msg = String(message || "Request failed");
+  if (/failed to fetch|load failed|networkerror|network error|cors/i.test(msg)) {
+    return "GDELT unreachable from this browser right now";
+  }
+  if (/abort|timeout/i.test(msg)) {
+    return "GDELT request timed out";
+  }
+  return msg;
+}
+
+function formatNewsUpdatedAge(date) {
+  if (!date) return "";
+  const mins = Math.floor((Date.now() - date.getTime()) / 60000);
+  return mins < 1 ? "Just now" : `${mins}m ago`;
+}
+
+function updateNewsFeedChrome() {
+  const titleEl = elements.newsTitle;
+  const badgeEl = elements.newsLiveBadge;
+  const dotEl = elements.newsLiveDot;
+  const updatedEl = elements.newsUpdated;
+  const age = formatNewsUpdatedAge(state.newsLastFetched);
+
+  if (titleEl) titleEl.textContent = "LIVE INTELLIGENCE FEED";
+  if (badgeEl) {
+    badgeEl.classList.remove("status-live", "status-loading", "status-error", "status-idle");
+  }
+  if (dotEl) {
+    dotEl.classList.remove("is-live", "is-loading", "is-error", "is-idle");
+  }
+
+  if (state.newsStatus === "loading") {
+    if (titleEl) titleEl.textContent = "SYNCING INTELLIGENCE FEED";
+    if (badgeEl) {
+      badgeEl.textContent = "SYNC";
+      badgeEl.setAttribute("aria-label", "Syncing");
+      badgeEl.classList.add("status-loading");
+    }
+    if (dotEl) dotEl.classList.add("is-loading");
+    if (updatedEl) updatedEl.textContent = "Fetching…";
+    return;
+  }
+
+  if (state.newsStatus === "error") {
+    if (titleEl) titleEl.textContent = "INTELLIGENCE FEED DEGRADED";
+    if (badgeEl) {
+      badgeEl.textContent = "DEGRADED";
+      badgeEl.setAttribute("aria-label", "Degraded");
+      badgeEl.classList.add("status-error");
+    }
+    if (dotEl) dotEl.classList.add("is-error");
+    if (updatedEl) updatedEl.textContent = "Feed issue";
+    return;
+  }
+
+  if (state.newsStatus === "idle") {
+    if (badgeEl) {
+      badgeEl.textContent = "STANDBY";
+      badgeEl.setAttribute("aria-label", "Standby");
+      badgeEl.classList.add("status-idle");
+    }
+    if (dotEl) dotEl.classList.add("is-idle");
+    if (updatedEl) updatedEl.textContent = age ? `No hits · ${age}` : "Awaiting sync";
+    return;
+  }
+
+  if (badgeEl) {
+    badgeEl.textContent = "LIVE";
+    badgeEl.setAttribute("aria-label", "Live");
+    badgeEl.classList.add("status-live");
+  }
+  if (dotEl) dotEl.classList.add("is-live");
+  if (updatedEl && age) updatedEl.textContent = age;
+}
+
 async function loadNewsCategory(catId, forceRefresh) {
+  setNewsStatus("loading", forceRefresh ? "Refreshing GDELT headlines" : "Loading GDELT headlines");
   if (forceRefresh) {
     invalidateNewsCache();
     renderNewsSkeletons();
@@ -6778,8 +7035,24 @@ async function loadNewsCategory(catId, forceRefresh) {
   try {
     const result = await fetchNewsCategory(catId);
     if (catId !== state.newsCategory) return; // category switched mid-fetch
+    if (result?.error) {
+      const message = formatNewsFeedError(result.error);
+      state.newsArticles = [];
+      state.newsLastFetched = result.fetchedAt ?? new Date();
+      setNewsUpdatedLabel(state.newsLastFetched);
+      updateCategoryCount(catId, 0);
+      updateBadge(0);
+      setNewsStatus("error", message);
+      renderNewsError(message);
+      renderNewsTickerHeadline();
+      return;
+    }
     state.newsArticles  = result.articles ?? [];
     state.newsLastFetched = result.fetchedAt ?? new Date();
+    setNewsStatus(
+      state.newsArticles.length ? "live" : "idle",
+      state.newsArticles.length ? `${state.newsArticles.length} headlines ready` : "No current GDELT headlines"
+    );
     setNewsUpdatedLabel(state.newsLastFetched);
     renderNewsCards(state.newsArticles);
     updateCategoryCount(catId, state.newsArticles.length);
@@ -6788,7 +7061,12 @@ async function loadNewsCategory(catId, forceRefresh) {
       setNewsTickerPool(state.newsArticles);
     }
   } catch (err) {
-    renderNewsError(`Fetch failed: ${err?.message ?? "Network error"}`);
+    const message = formatNewsFeedError(err?.message ?? "Network error");
+    state.newsArticles = [];
+    setNewsStatus("error", message);
+    updateBadge(0);
+    renderNewsError(message);
+    renderNewsTickerHeadline();
   } finally {
     animateRefreshButton(false);
   }
@@ -6798,20 +7076,42 @@ async function prefetchAllCategories() {
   try {
     const all = await fetchAllNewsCategories();
     const combinedPool = [];
+    const errors = [];
     Object.entries(all).forEach(([catId, result]) => {
       const catArticles = result.articles ?? [];
+      if (result?.error) errors.push(result.error);
       updateCategoryCount(catId, catArticles.length);
       combinedPool.push(...catArticles.slice(0, 4));
     });
-    setNewsTickerPool(combinedPool);
+    if (combinedPool.length) {
+      setNewsStatus("live", `${combinedPool.length} headlines aggregated`);
+      setNewsTickerPool(combinedPool);
+    } else if (errors.length) {
+      setNewsStatus("error", formatNewsFeedError(errors[0]));
+      renderNewsTickerHeadline();
+    } else {
+      setNewsStatus("idle", "No current GDELT headlines");
+      renderNewsTickerHeadline();
+    }
 
     // Seed default category
     const defaultResult = all[state.newsCategory];
-    if (defaultResult?.articles?.length) {
+    if (defaultResult?.error) {
+      if (state.newsOpen) renderNewsError(formatNewsFeedError(defaultResult.error));
+      state.newsArticles = [];
+      state.newsLastFetched = defaultResult.fetchedAt ?? new Date();
+      setNewsUpdatedLabel(state.newsLastFetched);
+      updateBadge(0);
+    } else if (defaultResult?.articles?.length) {
       state.newsArticles   = defaultResult.articles;
       state.newsLastFetched = defaultResult.fetchedAt;
       setNewsUpdatedLabel(state.newsLastFetched);
       updateBadge(state.newsArticles.length);
+    } else if (defaultResult?.fetchedAt) {
+      state.newsArticles = [];
+      state.newsLastFetched = defaultResult.fetchedAt;
+      setNewsUpdatedLabel(state.newsLastFetched);
+      updateBadge(0);
     }
   } catch { /* silent — will load on open */ }
 }
@@ -7192,13 +7492,25 @@ function renderNewsTickerHeadline(animate = false) {
 
   if (!state.newsTickerPool.length) {
     el.href = "https://www.gdeltproject.org";
-    el.textContent = "◉ Initializing signal feed…";
+    el.target = "_blank";
+    el.rel = "noopener noreferrer";
+    if (state.newsStatus === "loading") {
+      el.textContent = "◉ Syncing GDELT signal feed…";
+    } else if (state.newsStatus === "error") {
+      el.textContent = `◉ ${state.newsStatusMessage}`;
+    } else if (state.newsStatus === "idle") {
+      el.textContent = `◉ ${state.newsStatusMessage || "No current signal headlines"}`;
+    } else {
+      el.textContent = "◉ Initializing signal feed…";
+    }
     if (langBtn) langBtn.hidden = true;
     return;
   }
 
   const item = state.newsTickerPool[state.newsTickerIndex] ?? state.newsTickerPool[0];
   el.href = item.url;
+  el.target = "_blank";
+  el.rel = "noopener noreferrer";
 
   const lang = item.language;
   const nonEng = isNonEnglish(lang);
@@ -7272,9 +7584,9 @@ function renderNewsTickerHeadline(animate = false) {
 }
 
 function setNewsUpdatedLabel(date) {
-  if (!elements.newsUpdated || !date) return;
-  const mins = Math.floor((Date.now() - date.getTime()) / 60000);
-  elements.newsUpdated.textContent = mins < 1 ? "Just now" : `${mins}m ago`;
+  if (!date) return;
+  state.newsLastFetched = date;
+  updateNewsFeedChrome();
 }
 
 function updateCategoryCount(catId, count) {
@@ -7412,15 +7724,49 @@ function updateThroughput() {
 }
 
 // Signal status indicators
+function formatSignalStatusLabel(status) {
+  switch (status) {
+    case "live":
+      return "Live";
+    case "error":
+      return "Degraded";
+    case "loading":
+      return "Syncing";
+    case "config-required":
+      return "Setup required";
+    case "idle":
+    case "pending":
+    default:
+      return "Standby";
+  }
+}
+
+function getNewsSignalStatus() {
+  if (state.newsStatus === "error") return "error";
+  if (state.newsStatus === "loading") return "loading";
+  if (state.newsLastFetched || state.newsArticles.length) return "live";
+  return "pending";
+}
+
+function getIssSignalStatus() {
+  return _issStatus === "live" ? "live" : _issStatus === "error" ? "error" : "pending";
+}
+
 function updateSignalIndicators() {
   if (!elements.sigAdsb) return;
-  const setSignal = (el, status) => {
+  const setSignal = (el, label, status, message = "") => {
+    if (!el) return;
     el.classList.remove("green", "amber", "red");
     el.classList.add(status === "live" ? "green" : status === "error" ? "red" : "amber");
+    const wrapper = el.closest(".footer-signal");
+    if (wrapper) {
+      wrapper.title = `${label}: ${formatSignalStatusLabel(status)}${message ? ` · ${message}` : ""}`;
+    }
   };
-  setSignal(elements.sigAdsb, state.liveFeeds.adsb.status);
-  setSignal(elements.sigNews, state.newsLastFetched || state.newsArticles.length ? "live" : "pending");
-  setSignal(elements.sigAis, state.liveFeeds.ais.status);
+  setSignal(elements.sigAdsb, "ADS-B", state.liveFeeds.adsb.status, state.liveFeeds.adsb.message);
+  setSignal(elements.sigNews, "News", getNewsSignalStatus(), state.newsStatusMessage || "Global news telemetry standing by.");
+  setSignal(elements.sigAis, "AIS", state.liveFeeds.ais.status, state.liveFeeds.ais.message);
+  setSignal(elements.sigIss, "ISS", getIssSignalStatus(), _issStatusMessage);
 }
 
 // Master ambient update loop for all dynamic indicators
@@ -7461,7 +7807,11 @@ function initPresenceLayer() {
   setPresenceName(operatorName);
 
   // Render peer entities whenever the peer list changes
-  onPeersChanged(renderPresencePeers);
+  onPeersChanged(peers => {
+    renderPresencePeers(peers);
+    updatePresenceIndicator();
+  });
+  onPresenceStatusChanged(updatePresenceIndicator);
 
   // Update the presence status indicator every 3 seconds
   setInterval(updatePresenceIndicator, 3000);
@@ -7522,18 +7872,41 @@ function renderPresencePeers(peers) {
 function updatePresenceIndicator() {
   const el = document.getElementById("presence-indicator");
   if (!el) return;
-  const connected = isPresenceConnected();
+  const status = getPresenceStatus();
   const peerCount = getPresencePeers().size;
-  const online = navigator.onLine;
-  el.classList.toggle("connected", connected && online);
-  el.classList.toggle("offline", !online);
-  if (!online) {
-    el.textContent = "NET COMMS: OFFLINE";
-  } else {
-    el.textContent = connected
-      ? `NET COMMS: ${peerCount + 1} ACTIVE`
-      : "NET COMMS: STANDBY";
+  const browserOffline = navigator.onLine === false;
+
+  el.classList.toggle("connected", status === "connected");
+  el.classList.toggle("connecting", status === "connecting");
+  el.classList.toggle("degraded", status === "reconnecting");
+  el.classList.toggle("offline", false);
+
+  if (status === "connected") {
+    el.textContent = `NET COMMS: ${peerCount + 1} ACTIVE`;
+    el.title = peerCount
+      ? `Presence relay connected. ${peerCount} remote operator${peerCount === 1 ? "" : "s"} visible.`
+      : "Presence relay connected. No remote operators visible yet.";
+    return;
   }
+
+  if (status === "connecting") {
+    el.textContent = "NET COMMS: LINKING";
+    el.title = "Linking to the operator presence relay.";
+    return;
+  }
+
+  if (status === "reconnecting") {
+    el.textContent = "NET COMMS: RELAY DOWN";
+    el.title = browserOffline
+      ? "Presence relay unavailable. Retrying every 5 seconds. The browser also reports offline."
+      : "Presence relay unavailable. Retrying every 5 seconds.";
+    return;
+  }
+
+  el.textContent = "NET COMMS: STANDBY";
+  el.title = browserOffline
+    ? "Presence relay not initialized. The browser currently reports offline."
+    : "Presence relay standing by.";
 }
 
 // Listen for online/offline events
@@ -9236,55 +9609,75 @@ async function fetchISSPosition() {
 }
 
 function initISSTracking() {
-  if (!state.layers.iss) return;
+  if (!state.layers.iss) {
+    setIssStatus("idle", "ISS layer off.");
+    return;
+  }
 
-  // Create entity with a SampledPositionProperty for smooth interpolation
-  const sampledPos = new Cesium.SampledPositionProperty();
-  sampledPos.setInterpolationOptions({
-    interpolationDegree: 5,
-    interpolationAlgorithm: Cesium.LagrangePolynomialApproximation
-  });
+  _issEntity ??= viewer.entities.getById("iss-live") ?? null;
 
-  _issEntity = viewer.entities.add({
-    id: "iss-live",
-    position: sampledPos,
-    point: {
-      pixelSize: 9,
-      color: Cesium.Color.fromCssColorString("#60f7bf"),
-      outlineColor: Cesium.Color.WHITE.withAlpha(0.8),
-      outlineWidth: 1.5,
-      disableDepthTestDistance: Number.POSITIVE_INFINITY
-    },
-    label: {
-      text: "ISS",
-      font: '11px "Share Tech Mono", monospace',
-      fillColor: Cesium.Color.fromCssColorString("#60f7bf"),
-      outlineColor: Cesium.Color.BLACK.withAlpha(0.7),
-      outlineWidth: 2,
-      style: Cesium.LabelStyle.FILL_AND_OUTLINE,
-      showBackground: true,
-      backgroundColor: Cesium.Color.fromCssColorString("rgba(4,10,18,0.72)"),
-      backgroundPadding: new Cesium.Cartesian2(5, 3),
-      horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
-      pixelOffset: new Cesium.Cartesian2(10, -8),
-      disableDepthTestDistance: Number.POSITIVE_INFINITY,
-      scaleByDistance: new Cesium.NearFarScalar(5e5, 1.0, 1.5e7, 0.5),
-      translucencyByDistance: new Cesium.NearFarScalar(1e6, 1.0, 2e7, 0.0)
-    },
-    properties: {
-      layerId: "iss",
-      entityType: "satellite",
-      label: "ISS — International Space Station",
-      description: "Live orbital position — real-time tracking"
-    }
-  });
-  _issEntity._pulseSeed = Math.random() * Math.PI * 2;
+  let sampledPos = _issEntity?.position;
+  if (!(sampledPos instanceof Cesium.SampledPositionProperty)) {
+    sampledPos = new Cesium.SampledPositionProperty();
+    sampledPos.setInterpolationOptions({
+      interpolationDegree: 5,
+      interpolationAlgorithm: Cesium.LagrangePolynomialApproximation
+    });
+  }
+
+  if (!_issEntity) {
+    _issEntity = viewer.entities.add({
+      id: "iss-live",
+      position: sampledPos,
+      point: {
+        pixelSize: 9,
+        color: Cesium.Color.fromCssColorString("#60f7bf"),
+        outlineColor: Cesium.Color.WHITE.withAlpha(0.8),
+        outlineWidth: 1.5,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY
+      },
+      label: {
+        text: "ISS",
+        font: '11px "Share Tech Mono", monospace',
+        fillColor: Cesium.Color.fromCssColorString("#60f7bf"),
+        outlineColor: Cesium.Color.BLACK.withAlpha(0.7),
+        outlineWidth: 2,
+        style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+        showBackground: true,
+        backgroundColor: Cesium.Color.fromCssColorString("rgba(4,10,18,0.72)"),
+        backgroundPadding: new Cesium.Cartesian2(5, 3),
+        horizontalOrigin: Cesium.HorizontalOrigin.LEFT,
+        pixelOffset: new Cesium.Cartesian2(10, -8),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        scaleByDistance: new Cesium.NearFarScalar(5e5, 1.0, 1.5e7, 0.5),
+        translucencyByDistance: new Cesium.NearFarScalar(1e6, 1.0, 2e7, 0.0)
+      },
+      properties: {
+        layerId: "iss",
+        entityType: "satellite",
+        label: "ISS — International Space Station",
+        description: "Live orbital position — real-time tracking"
+      }
+    });
+    _issEntity._pulseSeed = Math.random() * Math.PI * 2;
+  } else if (_issEntity.position !== sampledPos) {
+    _issEntity.position = sampledPos;
+  }
+
+  if (_issTimer) {
+    _issEntity.show = true;
+    return;
+  }
+
+  setIssStatus("loading");
 
   const poll = async () => {
     if (!state.layers.iss) return;
     try {
       const d = await fetchISSPosition();
+      if (!state.layers.iss || !_issEntity) return;
       _issLastData = d;
+      setIssStatus("live", "Live orbital telemetry locked.");
       const altM = (d.altitude ?? 408) * 1000;
       const pos  = Cesium.Cartesian3.fromDegrees(d.longitude, d.latitude, altM);
       const time = Cesium.JulianDate.fromDate(new Date(d.timestamp * 1000));
@@ -9312,7 +9705,14 @@ function initISSTracking() {
           properties: { layerId: "iss", entityType: "trail" }
         });
       }
-    } catch { /* silent — will retry */ }
+    } catch (error) {
+      if (!state.layers.iss || !_issEntity) return;
+      const message = error?.name === "TimeoutError"
+        ? "ISS orbital telemetry timed out."
+        : "ISS orbital telemetry unreachable right now.";
+      setIssStatus("error", message);
+    }
+    if (!state.layers.iss || !_issEntity) return;
     _issTimer = setTimeout(poll, 5000);
   };
 
@@ -9321,10 +9721,12 @@ function initISSTracking() {
 
 function destroyISSTracking() {
   if (_issTimer) clearTimeout(_issTimer);
+  _issTimer = null;
   if (_issEntity)      { viewer.entities.remove(_issEntity);      _issEntity      = null; }
   if (_issTrailEntity) { viewer.entities.remove(_issTrailEntity); _issTrailEntity = null; }
   _issTrailPositions = [];
   _issLastData = null;
+  setIssStatus("idle", "ISS layer off.");
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -9356,6 +9758,7 @@ async function loadSeismicData() {
     );
     if (!resp.ok) return;
     const geojson = await resp.json();
+    if (!state.layers.seismic) return;
     clearSeismicEntities();
 
     (geojson.features ?? []).forEach(f => {
@@ -9406,10 +9809,12 @@ async function loadSeismicData() {
       _seismicEntities.push(entity);
     });
 
+    if (!state.layers.seismic) return;
     showToast(`Seismic layer: ${_seismicEntities.length} earthquakes loaded`, "info", 2500);
   } catch { /* silent */ }
 
   // Auto-refresh every 5 minutes
+  if (!state.layers.seismic) return;
   if (_seismicTimer) clearTimeout(_seismicTimer);
   _seismicTimer = setTimeout(loadSeismicData, 5 * 60 * 1000);
 }
@@ -9720,11 +10125,7 @@ async function initSituationBriefing() {
 // OPERATOR SYSTEM — callsign, session streak, shareable URL
 // ══════════════════════════════════════════════════════════════════════════════
 
-const OP_CALLSIGN_KEY = "ge-operator-callsign";
-const OP_STREAK_KEY   = "ge-visit-streak";
-const OP_LAST_KEY     = "ge-last-visit-date";
-
-function getOperatorCallsign() { return localStorage.getItem(OP_CALLSIGN_KEY) || ""; }
+function getOperatorCallsign() { return getStoredOperatorCallsign(); }
 
 function setOperatorCallsign(cs) {
   localStorage.setItem(OP_CALLSIGN_KEY, cs);
@@ -9736,9 +10137,10 @@ function updateClassificationBar(callsign) {
   const bar = document.getElementById("classification-bar");
   if (!bar) return;
   const base = "UNCLASSIFIED // OPEN SOURCE INTELLIGENCE // PANOPTICON-EARTH v2.0";
+  const status = getClassificationBarStatusText();
   bar.textContent = callsign
-    ? `${base} // OPERATOR: ${callsign.toUpperCase()} // ALL FEEDS ACTIVE`
-    : `${base} // ALL FEEDS ACTIVE`;
+    ? `${base} // OPERATOR: ${callsign.toUpperCase()} // ${status}`
+    : `${base} // ${status}`;
 }
 
 function updateCallsignChip(callsign) {
