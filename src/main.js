@@ -1,8 +1,9 @@
 import { BASEMAPS, DEFAULT_BOOKMARKS, FX_MODES, LAYERS, SCENARIO, STORAGE_KEYS, INCIDENT_POOL } from "./data/scenario.js";
 import { fetchLiveFeeds, fetchAisFeed, getConfiguredAisEndpoint, setConfiguredAisEndpoint } from "./services/live-feeds.js";
 import { NEWS_CATEGORIES, fetchNewsCategory, fetchAllNewsCategories, invalidateNewsCache } from "./services/news-feeds.js";
-import { initPresence, setPresenceName, getPresencePeers, onPeersChanged, isPresenceConnected } from "./services/presence.js";
+import { initPresence, setPresenceName, getPresencePeers, onPeersChanged, isPresenceConnected, isPresenceEnabled } from "./services/presence.js";
 import { initAudioEngine, sfx, setAudioEnabled, isAudioEnabled } from "./services/audio-engine.js";
+import { LOCAL_LIVE_RELAY_URL, SAME_ORIGIN_LIVE_RELAY_URL, fetchWithOptionalLiveRelay, getLiveRelayBase, getLiveRelayLabel, hasLiveRelay, setConfiguredLiveRelayBase } from "./services/live-relay.js";
 
 const Cesium = await loadCesium();
 
@@ -92,7 +93,7 @@ const MISSION_GUIDE_STEPS = [
   {
     kicker: "Quick Start",
     title: "Live intelligence, right now",
-    lead: "God's Third Eye pulls live ADS-B aircraft from OpenSky Network, real orbital tracks, maritime data, and GDELT 2.0 global news headlines — all rendered on a 3D WebGL globe with no backend required.",
+    lead: "God's Third Eye pulls live ADS-B aircraft from OpenSky Network, real orbital tracks, maritime data, and GDELT 2.0 global news headlines — all rendered on a 3D WebGL globe, with an optional relay when browser limits block upstream feeds.",
     sections: [
       { title: "Start Here", items: ["Hit Next Hotspot to jump to an active geopolitical alert zone", "Click any aircraft, satellite, vessel, or incident to open its Intel Sheet", "Open News Briefing to see live GDELT headlines linked to map events"] }
     ],
@@ -117,7 +118,7 @@ const MISSION_GUIDE_STEPS = [
   {
     kicker: "What It Is",
     title: "A real intelligence platform",
-    lead: "Built entirely in vanilla JS and CesiumJS — no framework, no backend. Every aircraft is a live ADS-B transponder. Every news event is a real GDELT headline. Every conflict burst is algorithmically tied to live geospatial data.",
+    lead: "Built entirely in vanilla JS and CesiumJS — no framework, and only an optional relay when upstream browser access is restricted. Every aircraft is a live ADS-B transponder. Every news event is a real GDELT headline or an honest cached relay snapshot. Every conflict burst is algorithmically tied to live geospatial data.",
     sections: [
       { title: "Live Data Sources", items: ["OpenSky Network: real ADS-B transponder data, globally, every 90s", "GDELT 2.0 DOC API: 100+ language global media corpus, 5 categories", "OpenStreetMap Nominatim: geocoding for click-to-inspect coordinate popups"] },
       { title: "Technical Highlights", items: ["CesiumJS 3D globe with WebGL bloom, FXAA, and day/night globe lighting", "Persistent layouts, bookmarks, and FX settings via localStorage", "Draggable glass-morphism HUD with live threat-level computation"] }
@@ -161,6 +162,7 @@ const state = {
   newsTickerIndex:       0,
   newsLastFetched:       null,
   newsRefreshTimer:      null,
+  newsWarmTimer:         null,
   newsTickerTimer:       null,
   newsTickerPaused:      false,
   newsCategoryTimer:     null,
@@ -182,6 +184,7 @@ const state = {
   nextRefreshAt:         null,
   liveFeeds: {
     adsb: { status: "idle", source: "OpenSky ADS-B",  message: "Awaiting refresh", records: [], updatedAt: null },
+    news: { status: "idle", source: "GDELT 2.0",      message: "Awaiting refresh", records: [], updatedAt: null },
     ais:  {
       status:  getConfiguredAisEndpoint() ? "idle" : "config-required",
       source:  "AIS Adapter",
@@ -992,8 +995,81 @@ const dynamic = {
   radars:      [],
   liveTraffic: [],
   eventVisuals: [],
-  connectionLines: []
+  connectionLines: [],
+  solar:       { glow: null, ring: null, marker: null }
 };
+
+function normalizeLongitudeDegrees(value) {
+  return ((value + 180) % 360 + 360) % 360 - 180;
+}
+
+function getSubsolarPoint(date = new Date()) {
+  const rad = Math.PI / 180;
+  const julianDay = date.getTime() / 86400000 + 2440587.5;
+  const centuries = (julianDay - 2451545.0) / 36525;
+
+  const meanLongitude = normalizeLongitudeDegrees(280.46646 + centuries * (36000.76983 + centuries * 0.0003032));
+  const meanAnomaly = normalizeLongitudeDegrees(357.52911 + centuries * (35999.05029 - 0.0001537 * centuries));
+  const equationOfCenter =
+    Math.sin(meanAnomaly * rad) * (1.914602 - centuries * (0.004817 + 0.000014 * centuries)) +
+    Math.sin(2 * meanAnomaly * rad) * (0.019993 - 0.000101 * centuries) +
+    Math.sin(3 * meanAnomaly * rad) * 0.000289;
+  const apparentLongitude = meanLongitude + equationOfCenter - 0.00569 - 0.00478 * Math.sin((125.04 - 1934.136 * centuries) * rad);
+  const obliquity = 23.439291 - 0.0130042 * centuries;
+
+  const declination = Math.asin(Math.sin(obliquity * rad) * Math.sin(apparentLongitude * rad)) / rad;
+  const rightAscension = Math.atan2(Math.cos(obliquity * rad) * Math.sin(apparentLongitude * rad), Math.cos(apparentLongitude * rad)) / rad;
+  const greenwichMeanSidereal = normalizeLongitudeDegrees(280.46061837 + 360.98564736629 * (julianDay - 2451545.0));
+
+  return {
+    lat: declination,
+    lng: normalizeLongitudeDegrees(rightAscension - greenwichMeanSidereal)
+  };
+}
+
+function initSolarOverlay() {
+  if (dynamic.solar.glow || dynamic.solar.ring || dynamic.solar.marker) return;
+
+  const { lat, lng } = getSubsolarPoint();
+  const glowColor = Cesium.Color.fromCssColorString("#7ee0ff").withAlpha(0.05);
+  const ringColor = Cesium.Color.fromCssColorString("#ffe08a").withAlpha(0.24);
+  const markerColor = Cesium.Color.fromCssColorString("#ffe08a").withAlpha(0.9);
+  dynamic.solar.glow = viewer.entities.add({
+    position: Cesium.Cartesian3.fromDegrees(lng, lat, 5000),
+    ellipse: {
+      semiMajorAxis: 1250000,
+      semiMinorAxis: 1250000,
+      height: 5000,
+      material: glowColor,
+      outline: false
+    }
+  });
+  dynamic.solar.ring = viewer.entities.add({
+    position: Cesium.Cartesian3.fromDegrees(lng, lat, 9000),
+    ellipse: {
+      semiMajorAxis: 1900000,
+      semiMinorAxis: 1900000,
+      height: 9000,
+      material: Cesium.Color.TRANSPARENT,
+      outline: true,
+      outlineColor: ringColor,
+      outlineWidth: 1
+    }
+  });
+  dynamic.solar.marker = viewer.entities.add({
+    position: Cesium.Cartesian3.fromDegrees(lng, lat, 14000),
+    point: {
+      pixelSize: 5,
+      color: markerColor,
+      outlineColor: Cesium.Color.fromCssColorString("#04111d").withAlpha(0.9),
+      outlineWidth: 1.5,
+      disableDepthTestDistance: Number.POSITIVE_INFINITY
+    }
+  });
+  dynamic.solar.glowColor = glowColor;
+  dynamic.solar.ringColor = ringColor;
+  dynamic.solar.markerColor = markerColor;
+}
 
 let frameSamples = [];
 let _consolePulseTimer = null;
@@ -1069,8 +1145,11 @@ viewer.scene.skyAtmosphere.brightnessShift = -0.08;
 viewer.scene.globe.atmosphereLightIntensity = 6.0;
 viewer.scene.globe.showGroundAtmosphere    = true;
 viewer.scene.globe.depthTestAgainstTerrain = false;
+if ("dynamicAtmosphereLighting" in viewer.scene.globe) viewer.scene.globe.dynamicAtmosphereLighting = true;
+if ("dynamicAtmosphereLightingFromSun" in viewer.scene.globe) viewer.scene.globe.dynamicAtmosphereLightingFromSun = true;
 viewer.clock.shouldAnimate                 = false;
 viewer.resolutionScale                     = Math.min(window.devicePixelRatio || 1, 1.6);
+initSolarOverlay();
 
 // ── Performance tuning ────────────────────────────────────────────────────────
 viewer.scene.globe.maximumScreenSpaceError = 2.5;   // default 2; slightly fewer tiles = faster
@@ -1244,6 +1323,10 @@ function startNarrativeTicker() {
 function cacheElements() {
   Object.assign(elements, {
     metricCluster:       document.getElementById("metric-cluster"),
+    layersHotspot:       document.getElementById("layers-hotspot"),
+    layersRandom:        document.getElementById("layers-random"),
+    layersNews:          document.getElementById("layers-news"),
+    layersGuide:         document.getElementById("layers-guide"),
     basemapButtons:      document.getElementById("basemap-buttons"),
     layerToggles:        document.getElementById("layer-toggles"),
     cameraPresets:       document.getElementById("camera-presets"),
@@ -1306,7 +1389,13 @@ function cacheElements() {
     btnMobileIntel:      document.getElementById("btn-mobile-intel"),
     btnMobileSignals:    document.getElementById("btn-mobile-signals"),
     feedStatus:          document.getElementById("feed-status"),
+    feedTransport:       document.getElementById("feed-transport"),
     refreshFeeds:        document.getElementById("refresh-feeds"),
+    liveRelayEndpoint:   document.getElementById("live-relay-endpoint"),
+    useLocalRelay:       document.getElementById("use-local-relay"),
+    useHostedRelay:      document.getElementById("use-hosted-relay"),
+    saveLiveRelay:       document.getElementById("save-live-relay"),
+    clearLiveRelay:      document.getElementById("clear-live-relay"),
     aisEndpoint:         document.getElementById("ais-endpoint"),
     saveAisEndpoint:     document.getElementById("save-ais-endpoint"),
     clearAisEndpoint:    document.getElementById("clear-ais-endpoint"),
@@ -1386,6 +1475,7 @@ function cacheElements() {
   if (elements.fxIntensity)    elements.fxIntensity.value   = String(state.fxIntensity);
   if (elements.fxGlow)         elements.fxGlow.value        = String(state.fxGlow);
   if (elements.refreshInterval) elements.refreshInterval.value = String(state.refreshIntervalSec);
+  if (elements.liveRelayEndpoint) elements.liveRelayEndpoint.value = getLiveRelayBase();
   if (elements.aisEndpoint)    elements.aisEndpoint.value   = getConfiguredAisEndpoint();
   syncMobileActionButtons();
 }
@@ -1830,10 +1920,18 @@ function startWallClock() {
     updateZones();
     updateIncidents();
     if (state.spinning && performance.now() >= state.spinPausedUntil && !state.trackedEntity) {
-      viewer.scene.camera.rotate(Cesium.Cartesian3.UNIT_Z, Cesium.Math.toRadians(0.012));
+      viewer.scene.camera.rotate(Cesium.Cartesian3.UNIT_Z, getPassiveSpinStep());
     }
     viewer.scene.requestRender();
   }, 200);
+}
+
+function getPassiveSpinStep() {
+  const height = viewer.camera.positionCartographic?.height ?? STARTUP_VIEW.height;
+  const heightFactor = Cesium.Math.clamp((height - 600000) / 22000000, 0, 1);
+  const pitchFactor = Cesium.Math.clamp((Math.abs(viewer.camera.pitch) - Cesium.Math.toRadians(25)) / Cesium.Math.toRadians(65), 0.45, 1);
+  const degreesPerTick = 0.004 + heightFactor * 0.02;
+  return Cesium.Math.toRadians(degreesPerTick * pitchFactor);
 }
 
 function scheduleRefresh() {
@@ -1882,25 +1980,141 @@ function updateMetricCard(key, value, foot) {
   updateSparkline(key, typeof value === "number" ? value : parseInt(value, 10) || 0);
 }
 
+function getFeedStatusLabel(status) {
+  switch (status) {
+    case "config-required": return "OPTIONAL";
+    case "restricted":      return "RESTRICTED";
+    case "live":            return "LIVE";
+    case "idle":            return "IDLE";
+    case "error":           return "ERROR";
+    default:                 return String(status ?? "unknown").toUpperCase();
+  }
+}
+
+function getFeedHealthSnapshot() {
+  const feeds = [state.liveFeeds.adsb, state.liveFeeds.news, state.liveFeeds.ais];
+  const requiredFeeds = feeds.filter(feed => feed.status !== "config-required");
+  const liveCount = feeds.filter(feed => feed.status === "live").length;
+  const restrictedCount = feeds.filter(feed => feed.status === "restricted").length;
+  const errorCount = feeds.filter(feed => feed.status === "error").length;
+  const optionalCount = feeds.filter(feed => feed.status === "config-required").length;
+  const allRequiredLive = requiredFeeds.length > 0 && requiredFeeds.every(feed => feed.status === "live");
+
+  return {
+    liveCount,
+    restrictedCount,
+    errorCount,
+    optionalCount,
+    stage: allRequiredLive ? "LIVE" : liveCount >= 1 ? "HYBRID" : (restrictedCount || errorCount) ? "DEGRADED" : "STANDBY",
+    mode: allRequiredLive ? "LIVE FEED" : liveCount >= 1 ? "HYBRID FEED" : (restrictedCount || errorCount) ? "DEGRADED FEED" : "STANDBY",
+    metricFoot:
+      allRequiredLive
+        ? "Primary sources live"
+        : liveCount >= 2
+          ? "Most sources live"
+          : liveCount === 1
+          ? "Partial live"
+          : (restrictedCount || errorCount)
+            ? "Scenario fallback active"
+            : optionalCount
+              ? "Awaiting live sources"
+              : "Feeds loading",
+    confidence: allRequiredLive ? "High" : liveCount >= 1 ? "Moderate" : (restrictedCount || errorCount) ? "Limited" : "Standby"
+  };
+}
+
+function getFeedSummaryText(feed, shortLabel, liveNoun) {
+  switch (feed.status) {
+    case "live":
+      return `${feed.records.length} ${liveNoun} live`;
+    case "restricted":
+      return `${shortLabel} browser-limited`;
+    case "config-required":
+      return `${shortLabel} optional`;
+    case "error":
+      return `${shortLabel} unavailable`;
+    default:
+      return `${shortLabel} pending`;
+  }
+}
+
+function getFeedHintText() {
+  if (state.liveFeeds.adsb.status === "restricted" || state.liveFeeds.news.status === "restricted") {
+    return hasLiveRelay()
+      ? `Configured relay (${getLiveRelayLabel()}) is unavailable here. Scenario coverage stays online while OpenSky or GDELT recover.`
+      : "OpenSky and GDELT can be browser-restricted in static deployments. Add a live relay to restore aircraft and intelligence ingestion; AIS remains optional.";
+  }
+  if (hasLiveRelay()) {
+    return `Relay active via ${getLiveRelayLabel()}. OpenSky and GDELT are routed through the configured endpoint; AIS remains optional until you add a vessel feed.`;
+  }
+  if (state.liveFeeds.ais.status === "config-required") {
+    return "ADS-B aircraft data and GDELT intelligence are monitored automatically when upstream access allows it. AIS remains optional until you add a CORS-safe JSON endpoint.";
+  }
+  return "ADS-B aircraft data and GDELT intelligence are monitored live when upstream sources allow browser access. AIS maritime tracking requires a CORS-safe JSON endpoint.";
+}
+
+function renderFeedTransport() {
+  if (!elements.feedTransport) return;
+
+  const relayActive = hasLiveRelay();
+  const relayBase = relayActive ? getLiveRelayBase() : "";
+  const relayLabel = relayActive ? getLiveRelayLabel() : "DIRECT";
+  const degraded = relayActive && [state.liveFeeds.adsb.status, state.liveFeeds.news.status].some(status => status === "restricted" || status === "error");
+  const statusClass = relayActive ? (degraded ? "degraded" : "active") : "direct";
+  const title = relayActive ? `Relay active · ${relayLabel}` : "Direct browser transport";
+  const detail = relayActive
+    ? `ADS-B, GDELT, and ISS route through ${relayLabel}. ${degraded ? "The relay is degraded, so scenario coverage or cache may be filling gaps." : "Live recovery is enabled for browser-limited feeds."}`
+    : "The dashboard is calling upstream sources directly from the browser. Static deployments can hit CORS or rate limits without a relay.";
+  const endpoint = relayActive ? relayBase : "Browser direct to upstream sources";
+
+  elements.feedTransport.innerHTML = `
+    <article class="feed-transport-card ${statusClass}">
+      <div class="feed-transport-head">
+        <span class="feed-transport-eyebrow">Transport Path</span>
+        <strong>${title}</strong>
+      </div>
+      <p>${detail}</p>
+      <small>${endpoint}</small>
+    </article>
+  `;
+}
+
 function renderFeedStatus() {
   if (!elements.feedStatus) return;
-  const feeds = [state.liveFeeds.adsb, state.liveFeeds.ais];
+  renderFeedTransport();
+  const feeds = [state.liveFeeds.adsb, state.liveFeeds.news, state.liveFeeds.ais];
   elements.feedStatus.innerHTML = feeds.map(feed => `
     <article class="feed-card ${feed.status}">
       <div class="feed-card-head">
         <strong>${feed.source}</strong>
-        <span>${feed.status.toUpperCase()}</span>
+        <span>${getFeedStatusLabel(feed.status)}</span>
       </div>
       <p>${feed.message}</p>
       <small>${feed.updatedAt ? new Date(feed.updatedAt).toLocaleTimeString([], { hour12: false }) : "Not yet refreshed"}</small>
     </article>
   `).join("");
+  if (elements.feedHint) elements.feedHint.textContent = getFeedHintText();
 }
 
 function renderTrustIndicators() {
   if (!elements.trustIndicators) return;
 
-  const adsbStatus = state.liveFeeds.adsb.status === "live" ? "live" : state.liveFeeds.adsb.status === "error" ? "error" : "pending";
+  const feedHealth = getFeedHealthSnapshot();
+
+  const adsbStatus = state.liveFeeds.adsb.status === "live"
+    ? "live"
+    : state.liveFeeds.adsb.status === "restricted"
+      ? "degraded"
+      : state.liveFeeds.adsb.status === "error"
+        ? "error"
+        : "pending";
+  const newsStatus = state.liveFeeds.news.status === "live"
+    ? "live"
+    : state.liveFeeds.news.status === "restricted"
+      ? "degraded"
+      : state.liveFeeds.news.status === "error"
+        ? "error"
+        : "pending";
   const aisStatus = state.liveFeeds.ais.status === "live"
     ? "live"
     : state.liveFeeds.ais.status === "config-required"
@@ -1912,8 +2126,9 @@ function renderTrustIndicators() {
 
   const indicators = [
     { label: "ADS-B",     value: state.liveFeeds.adsb.status.toUpperCase(), status: adsbStatus },
+    { label: "News",      value: state.liveFeeds.news.status.toUpperCase(), status: newsStatus },
     { label: "AIS",       value: state.liveFeeds.ais.status.toUpperCase(),  status: aisStatus },
-    { label: "UTC Sync",  value: "LOCKED", status: "verified" },
+    { label: "Relay",     value: hasLiveRelay() ? getLiveRelayLabel().toUpperCase() : "DIRECT", status: hasLiveRelay() ? "verified" : "pending" },
     { label: "Refresh",   value: `${state.refreshIntervalSec}s`, status: refreshStatus }
   ];
 
@@ -1922,9 +2137,19 @@ function renderTrustIndicators() {
   ).join("");
 
   if (!elements.trustSummary) return;
-  const liveCount = [state.liveFeeds.adsb, state.liveFeeds.ais].filter(feed => feed.status === "live").length;
-  const confidence = liveCount === 2 ? "High" : liveCount === 1 ? "Moderate" : "Limited";
-  elements.trustSummary.textContent = `Source confidence: ${confidence}. Geospatial index and UTC sync are active.`;
+  let trustSummary = `Source confidence: ${feedHealth.confidence}. `;
+  if (feedHealth.restrictedCount) {
+    trustSummary += hasLiveRelay()
+      ? `The configured relay (${getLiveRelayLabel()}) is not fully healthy, so cached or scenario coverage is filling the gap.`
+      : "Some direct browser sources are restricted, so scenario coverage is filling the gap.";
+  } else if (feedHealth.errorCount) {
+    trustSummary += "One or more live feeds are currently unavailable.";
+  } else if (feedHealth.optionalCount && !feedHealth.liveCount) {
+    trustSummary += "Optional live sources are not configured yet.";
+  } else {
+    trustSummary += "Geospatial index and UTC sync are active.";
+  }
+  elements.trustSummary.textContent = trustSummary;
 }
 
 function renderLegend() {
@@ -2456,7 +2681,7 @@ function rebuildConnectionLines() {
     for (let j = i + 1; j < events.length; j++) {
       const a = events[i], b = events[j];
       const dlat = a.lat - b.lat;
-      const dlng = a.lng - b.lng;
+      const dlng = normalizeLongitudeDegrees(a.lng - b.lng);
       const dist = Math.sqrt(dlat * dlat + dlng * dlng);
       if (dist < MAX_DEG_DIST) {
         pairs.push({ a, b, dist });
@@ -2468,20 +2693,24 @@ function rebuildConnectionLines() {
   pairs.sort((x, y) => x.dist - y.dist);
   const selected = pairs.slice(0, MAX_LINES);
 
-  for (const { a, b } of selected) {
-    const midAlt = 6000 + Math.random() * 4000;
+  for (const { a, b, dist } of selected) {
+    const midAlt = 5200 + dist * 180;
+    const midLng = normalizeLongitudeDegrees(b.lng + normalizeLongitudeDegrees(a.lng - b.lng) / 2);
+    const baseColor = Cesium.Color.fromCssColorString("#6fd7ff");
+    const dashColor = baseColor.clone();
+    const dashState = { color: dashColor, dashLength: 16 };
     const line = viewer.entities.add({
       polyline: {
         positions: Cesium.Cartesian3.fromDegreesArrayHeights([
           a.lng, a.lat, 1200,
-          (a.lng + b.lng) / 2, (a.lat + b.lat) / 2, midAlt,
+          midLng, (a.lat + b.lat) / 2, midAlt,
           b.lng, b.lat, 1200
         ]),
         width: 1.5,
         material: new Cesium.PolylineDashMaterialProperty({
-          color: Cesium.Color.fromCssColorString("#8b5cf6").withAlpha(0.4),
+          color: new Cesium.CallbackProperty(() => dashState.color, false),
           gapColor: Cesium.Color.TRANSPARENT,
-          dashLength: 16
+          dashLength: new Cesium.CallbackProperty(() => dashState.dashLength, false)
         }),
         arcType: Cesium.ArcType.GEODESIC
       },
@@ -2492,6 +2721,9 @@ function rebuildConnectionLines() {
         description: "Event correlation link"
       }
     });
+    line._pulseSeed = Math.random() * Math.PI * 2;
+    line._baseColor = baseColor;
+    line._dashState = dashState;
     dynamic.connectionLines.push(line);
   }
 
@@ -2997,6 +3229,8 @@ function createZones() {
   SCENARIO.zones.forEach(zone => {
     let entity;
     const color = Cesium.Color.fromCssColorString(zone.color);
+    const fillColor = color.clone();
+    fillColor.alpha = zone.fill;
     if (zone.kind === "rectangle") {
       entity = viewer.entities.add({
         id: zone.id,
@@ -3005,7 +3239,7 @@ function createZones() {
             zone.coordinates.west, zone.coordinates.south,
             zone.coordinates.east, zone.coordinates.north
           ),
-          material:     color.withAlpha(zone.fill),
+          material:     fillColor,
           outline:      true,
           outlineColor: color.withAlpha(0.75),
           height:       0
@@ -3017,7 +3251,7 @@ function createZones() {
         id: zone.id,
         polygon: {
           hierarchy:    Cesium.Cartesian3.fromDegreesArray(zone.coordinates.flat()),
-          material:     color.withAlpha(zone.fill),
+          material:     fillColor,
           outline:      true,
           outlineColor: color.withAlpha(0.8),
           perPositionHeight: false
@@ -3026,6 +3260,7 @@ function createZones() {
       });
     }
     entity._zoneColor = color;
+    entity._zoneFillColor = fillColor;
     entity._baseFill  = zone.fill;
     entity._pulseSeed = Math.random() * Math.PI * 2;
     dynamic.zones.push({ entity, zone });
@@ -3071,6 +3306,10 @@ function createIncidents() {
         height:       0
       }
     });
+    ring._ringColor = Cesium.Color.fromCssColorString("#ff6d8d").withAlpha(0.09);
+    ring._ringOutlineColor = Cesium.Color.fromCssColorString("#ff6d8d").withAlpha(0.4);
+    ring.ellipse.material = ring._ringColor;
+    ring.ellipse.outlineColor = ring._ringOutlineColor;
     ring._pulseSeed = Math.random() * Math.PI * 2;
     dynamic.rings.push({ entity: ring, incident });
   });
@@ -3168,12 +3407,8 @@ function shuffleArray(arr) {
 // Falls back to the pool's built-in description silently on any failure.
 async function fetchGdeltDescriptionForRegion(label, tags) {
   try {
-    const query = encodeURIComponent(label.replace(/[^a-zA-Z0-9 ]/g, ""));
-    const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${query}&mode=artlist&maxrecords=3&timespan=12h&format=json`;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const articles = data?.articles;
+    const query = label.replace(/[^a-zA-Z0-9 ]/g, "");
+    const articles = await gdeltDocFetch(query, 3, "12h");
     if (!Array.isArray(articles) || !articles.length) return null;
     // Pick the first article with a non-trivial title
     const art = articles.find(a => a.title && a.title.length > 20) ?? articles[0];
@@ -3448,26 +3683,26 @@ function updateLiveMetrics() {
   const visibleTraffic = dynamic.traffic.filter(e => e.show).length + dynamic.liveTraffic.filter(e => e.show).length;
   const activeAlerts   = dynamic.incidents.filter(({ entity }) => entity.show).length + dynamic.zones.filter(({ entity }) => entity.show).length;
   const visibleOrbits  = dynamic.traffic.filter(e => e.show && e.properties.layerId.getValue(viewer.clock.currentTime) === "satellites").length;
-  const liveFeeds      = [state.liveFeeds.adsb, state.liveFeeds.ais].filter(f => f.status === "live").length;
+  const feedHealth     = getFeedHealthSnapshot();
+  const liveFeeds      = feedHealth.liveCount;
 
   updateMetricCard("tracks", visibleTraffic, `${Math.max(1, Math.round(visibleTraffic * 0.35))} sectors monitored`);
   updateMetricCard("alerts", activeAlerts,   activeAlerts ? "Active disruptions" : "No disruptions");
   updateMetricCard("orbits", visibleOrbits,  "Overhead coverage");
-  updateMetricCard("feeds",  liveFeeds,      liveFeeds === 2 ? "All sources live" : liveFeeds === 1 ? "Partial live" : "Feeds loading");
+  updateMetricCard("feeds",  liveFeeds,      feedHealth.metricFoot);
 
   if (elements.hudTrackCount) elements.hudTrackCount.textContent = `${visibleTraffic} tracks`;
   if (elements.hudAlertCount) elements.hudAlertCount.textContent = `${activeAlerts} alerts`;
-  if (elements.hudStatusText) elements.hudStatusText.textContent = "LIVE";
+  if (elements.hudStatusText) elements.hudStatusText.textContent = feedHealth.stage;
   if (elements.liveRegionLabel) elements.liveRegionLabel.textContent = "Global Intelligence Active";
-  if (elements.hudStatusMode) elements.hudStatusMode.textContent = "LIVE FEED";
+  if (elements.hudStatusMode) elements.hudStatusMode.textContent = feedHealth.mode;
 
-  if (elements.summaryStage) elements.summaryStage.textContent = "LIVE";
+  if (elements.summaryStage) elements.summaryStage.textContent = feedHealth.stage;
   if (elements.summaryCopy) {
-    const adsbMsg = state.liveFeeds.adsb.status === "live"
-      ? `${state.liveFeeds.adsb.records.length} aircraft` : "ADS-B pending";
-    const aisMsg  = state.liveFeeds.ais.status === "live"
-      ? `${state.liveFeeds.ais.records.length} vessels` : "AIS unconfigured";
-    elements.summaryCopy.textContent = `${adsbMsg} \u00b7 ${aisMsg} \u00b7 ${visibleOrbits} orbital tracks monitored.`;
+    const adsbMsg = getFeedSummaryText(state.liveFeeds.adsb, "ADS-B", "aircraft");
+    const newsMsg = getFeedSummaryText(state.liveFeeds.news, "NEWS", "stories");
+    const aisMsg  = getFeedSummaryText(state.liveFeeds.ais, "AIS", "vessels");
+    elements.summaryCopy.textContent = `${adsbMsg} \u00b7 ${newsMsg} \u00b7 ${aisMsg} \u00b7 ${visibleOrbits} orbital tracks monitored.`;
   }
 
   if (state.regionFocus && Date.now() - state.regionFocus.timestamp < 120000) {
@@ -3517,16 +3752,57 @@ function updateAmbientEffects() {
   dynamic.zones.forEach(({ entity }) => {
     if (!entity.show) return;
     const alpha = entity._baseFill + (Math.sin(phase + entity._pulseSeed) + 1) * 0.02;
-    if (entity.rectangle) entity.rectangle.material = entity._zoneColor.withAlpha(alpha);
-    if (entity.polygon)   entity.polygon.material   = entity._zoneColor.withAlpha(alpha);
+    if (entity._zoneFillColor) entity._zoneFillColor.alpha = alpha;
   });
   dynamic.rings.forEach(({ entity }) => {
     if (!entity.show || !entity.ellipse) return;
     const pulse = (Math.sin(phase + entity._pulseSeed) + 1) / 2;
     entity.ellipse.semiMajorAxis = 160000 + pulse * 90000;
     entity.ellipse.semiMinorAxis = 160000 + pulse * 90000;
-    entity.ellipse.material = Cesium.Color.fromCssColorString("#ff6d8d").withAlpha(0.05 + pulse * 0.08);
+    if (entity._ringColor) entity._ringColor.alpha = 0.05 + pulse * 0.08;
+    if (entity._ringOutlineColor) entity._ringOutlineColor.alpha = 0.24 + pulse * 0.24;
   });
+  dynamic.connectionLines.forEach(line => {
+    if (!line.show || !line.polyline) return;
+    const pulse = (Math.sin(phase * 0.85 + (line._pulseSeed || 0)) + 1) / 2;
+    line.polyline.width = 1.2 + pulse * 1.1;
+    const baseColor = line._baseColor || Cesium.Color.fromCssColorString("#6fd7ff");
+    const dashState = line._dashState || (line._dashState = { color: baseColor.clone(), dashLength: 16 });
+    const dashColor = dashState.color;
+    dashColor.red = baseColor.red;
+    dashColor.green = baseColor.green;
+    dashColor.blue = baseColor.blue;
+    dashColor.alpha = 0.18 + pulse * 0.26;
+    dashState.dashLength = 14 + pulse * 5;
+  });
+  if (_issEntity?.show && _issEntity.point) {
+    const pulse = (Math.sin(phase * 1.25 + (_issEntity._pulseSeed || 0)) + 1) / 2;
+    _issEntity.point.pixelSize = (_issEntity._basePixelSize || 9) + pulse * 2.4;
+    if (_issEntity._pointColor) _issEntity._pointColor.alpha = 0.76 + pulse * 0.2;
+  }
+  if (_issTrailEntity?.show && _issTrailEntity.polyline) {
+    const pulse = (Math.sin(phase + (_issTrailEntity._pulseSeed || 0)) + 1) / 2;
+    _issTrailEntity.polyline.width = 1.1 + pulse * 1.2;
+    if (_issTrailEntity._trailColor) _issTrailEntity._trailColor.alpha = 0.14 + pulse * 0.26;
+  }
+  if (dynamic.solar.glow && dynamic.solar.ring && dynamic.solar.marker) {
+    const { lat, lng } = getSubsolarPoint();
+    const solarPulse = (Math.sin(phase * 0.32) + 1) / 2;
+    dynamic.solar.glow.position = Cesium.Cartesian3.fromDegrees(lng, lat, 5000);
+    dynamic.solar.ring.position = Cesium.Cartesian3.fromDegrees(lng, lat, 9000);
+    dynamic.solar.marker.position = Cesium.Cartesian3.fromDegrees(lng, lat, 14000);
+    dynamic.solar.glow.ellipse.semiMajorAxis = 1180000 + solarPulse * 220000;
+    dynamic.solar.glow.ellipse.semiMinorAxis = 1180000 + solarPulse * 220000;
+    if (dynamic.solar.glowColor) dynamic.solar.glowColor.alpha = 0.04 + solarPulse * 0.04;
+    dynamic.solar.ring.ellipse.semiMajorAxis = 1820000 + solarPulse * 280000;
+    dynamic.solar.ring.ellipse.semiMinorAxis = 1820000 + solarPulse * 280000;
+    if (dynamic.solar.ringColor) dynamic.solar.ringColor.alpha = 0.16 + solarPulse * 0.18;
+    if (dynamic.solar.markerColor) dynamic.solar.markerColor.alpha = 0.78 + solarPulse * 0.18;
+    dynamic.solar.marker.point.pixelSize = 4 + solarPulse * 2.2;
+  }
+  if (viewer.scene.globe.atmosphereLightIntensity !== undefined) {
+    viewer.scene.globe.atmosphereLightIntensity = 5.8 + Math.sin(phase * 0.18) * 0.35;
+  }
 }
 
 function openIntelSheet(entity) {
@@ -3741,7 +4017,8 @@ async function refreshLiveFeeds() {
   if (elements.liveLastRefresh) elements.liveLastRefresh.textContent = "Refreshing feeds\u2026";
   const shimmer = document.getElementById("refresh-shimmer");
   if (shimmer) shimmer.classList.add("active");
-  state.liveFeeds = await fetchLiveFeeds();
+  const refreshedFeeds = await fetchLiveFeeds();
+  state.liveFeeds = { ...state.liveFeeds, ...refreshedFeeds };
   if (shimmer) shimmer.classList.remove("active");
   renderFeedStatus();
   renderTrustIndicators();
@@ -3761,7 +4038,7 @@ async function refreshLiveFeeds() {
   refreshEntityVisibility();
   const now = new Date().toLocaleTimeString([], { hour12: false });
   if (elements.liveLastRefresh) elements.liveLastRefresh.textContent = `Last refresh: ${now} UTC`;
-  if (elements.hudStatusMode)   elements.hudStatusMode.textContent   = "LIVE FEED";
+  updateLiveMetrics();
   state.nextRefreshAt = Date.now() + state.refreshIntervalSec * 1000;
   state._lastRefreshTime = Date.now();
   updateRefreshCountdown();
@@ -4033,12 +4310,28 @@ function latLngToRegionKeywords(lat, lng) {
   return '(conflict OR military OR attack OR crisis OR security)';
 }
 
-async function gdeltDocFetch(query, maxrecords = 5) {
-  const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=artlist&maxrecords=${maxrecords}&timespan=48h&sort=DateDesc&format=json`;
-  const resp = await fetch(url, { signal: AbortSignal.timeout(9000) });
-  if (!resp.ok) return [];
-  const data = await resp.json();
-  return Array.isArray(data?.articles) ? data.articles : [];
+async function gdeltDocFetch(query, maxrecords = 5, timespan = "48h") {
+  try {
+    const directUrl = `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(query)}&mode=artlist&maxrecords=${maxrecords}&timespan=${encodeURIComponent(timespan)}&sort=DateDesc&format=json`;
+    const result = await fetchWithOptionalLiveRelay({
+      relayPath: "gdelt",
+      relayParams: {
+        query,
+        mode: "ArtList",
+        maxrecords,
+        timespan,
+        sort: "DateDesc"
+      },
+      directUrl,
+      timeoutMs: 12000,
+      allowDirectFallback: !hasLiveRelay()
+    });
+    if (!result?.response?.ok) return [];
+    const data = await result.response.json();
+    return Array.isArray(data?.articles) ? data.articles : [];
+  } catch {
+    return [];
+  }
 }
 
 async function fetchGdeltArticlesForLocation(countryOrArea, lat, lng) {
@@ -4377,7 +4670,7 @@ function startBootIntro() {
   if (quickBoot) {
     fillEl.style.width = "100%";
     statusEl.textContent = "● GOD'S THIRD EYE ONLINE";
-    finishBoot({ immediate: true });
+    window.setTimeout(() => finishBoot({ immediate: true }), 0);
     return;
   }
 
@@ -6111,6 +6404,10 @@ function registerEvents() {
   });
 
   elements.refreshFeeds?.addEventListener("click",       () => refreshLiveFeeds());
+  elements.layersHotspot?.addEventListener("click",      focusNextHotspot);
+  elements.layersRandom?.addEventListener("click",       focusRandomTrack);
+  elements.layersNews?.addEventListener("click",         toggleNewsPanel);
+  elements.layersGuide?.addEventListener("click",        () => openMissionGuide(state.onboardingStep || 0));
   elements.opsNextHotspot?.addEventListener("click",     focusNextHotspot);
   elements.opsRandomTrack?.addEventListener("click",     focusRandomTrack);
   elements.opsOpenIntel?.addEventListener("click",       () => {
@@ -6118,6 +6415,38 @@ function registerEvents() {
   });
   elements.opsBriefFocus?.addEventListener("click",      createFocusBrief);
   elements.opsTourToggle?.addEventListener("click",      toggleAlertTour);
+  elements.useLocalRelay?.addEventListener("click",      () => {
+    if (elements.liveRelayEndpoint) elements.liveRelayEndpoint.value = LOCAL_LIVE_RELAY_URL;
+  });
+  elements.useHostedRelay?.addEventListener("click",     () => {
+    if (elements.liveRelayEndpoint) elements.liveRelayEndpoint.value = SAME_ORIGIN_LIVE_RELAY_URL;
+  });
+  elements.saveLiveRelay?.addEventListener("click",      () => {
+    const endpoint = elements.liveRelayEndpoint?.value.trim() || "";
+    setConfiguredLiveRelayBase(endpoint);
+    renderFeedStatus();
+    renderTrustIndicators();
+    updateLiveMetrics();
+    if (elements.feedHint) {
+      elements.feedHint.textContent = endpoint
+        ? "Live relay saved. Refreshing aircraft and intelligence feeds…"
+        : getFeedHintText();
+    }
+    invalidateNewsCache();
+    scheduleActiveNewsWarm(0, true);
+    refreshLiveFeeds();
+  });
+  elements.clearLiveRelay?.addEventListener("click",     () => {
+    if (elements.liveRelayEndpoint) elements.liveRelayEndpoint.value = "";
+    setConfiguredLiveRelayBase("");
+    renderFeedStatus();
+    renderTrustIndicators();
+    updateLiveMetrics();
+    if (elements.feedHint) elements.feedHint.textContent = "Live relay cleared. Returning to direct source checks.";
+    invalidateNewsCache();
+    scheduleActiveNewsWarm(0, true);
+    refreshLiveFeeds();
+  });
   elements.saveAisEndpoint?.addEventListener("click",    () => {
     const endpoint = elements.aisEndpoint.value.trim();
     setConfiguredAisEndpoint(endpoint);
@@ -6318,9 +6647,8 @@ function registerEvents() {
     state.regionFocus = null;
     state.selectedEntity = null;
     if (elements.searchMeta) elements.searchMeta.textContent = "Search a place, alert, route, or saved view.";
-    if (elements.hudStatusMode) elements.hudStatusMode.textContent = "LIVE FEED";
-    if (elements.liveRegionLabel) elements.liveRegionLabel.textContent = "Global Intelligence Active";
     closeIntelSheet();
+    updateLiveMetrics();
     flyToDestination({
       lng: SCENARIO.initialView.lng,
       lat: SCENARIO.initialView.lat,
@@ -6674,7 +7002,7 @@ function initNewsPanel() {
   elements.newsRefreshAll = document.getElementById("news-refresh-all");
   elements.newsRefreshAll?.addEventListener("click", () => {
     invalidateNewsCache();
-    prefetchAllCategories();
+    prefetchAllCategories(true);
   });
   // Pause/play auto-rotation
   elements.newsRotateToggle = document.getElementById("news-rotate-toggle");
@@ -6695,19 +7023,19 @@ function initNewsPanel() {
   // Auto-refresh every 90 seconds (matches main refresh cadence)
   state.newsRefreshTimer = window.setInterval(() => {
     invalidateNewsCache();
-    loadNewsCategory(state.newsCategory, false);
+    scheduleActiveNewsWarm(0, false);
   }, 90_000);
 
   // Background full-category refresh every 3 minutes so the event visual
   // label pool stays current even when the news panel is closed
   window.setInterval(() => {
-    prefetchAllCategories();
+    prefetchAllCategories(false);
   }, 180_000);
 
   startNewsTicker();
 
   // Kick off initial fetch silently (panel starts closed)
-  prefetchAllCategories();
+  scheduleActiveNewsWarm(0, true);
 }
 
 function toggleNewsPanel() {
@@ -6769,6 +7097,38 @@ function updateCatPillSelection(catId) {
   });
 }
 
+function syncNewsFeedState(result) {
+  const articles = result?.articles ?? [];
+  const fetchedAt = result?.fetchedAt ?? state.newsLastFetched ?? new Date();
+  state.liveFeeds.news = {
+    status: result?.status ?? (articles.length ? "live" : "idle"),
+    source: "GDELT 2.0",
+    message: result?.message ?? (articles.length ? `${articles.length} live intelligence stories` : "No recent stories returned"),
+    records: articles,
+    updatedAt: fetchedAt.toISOString()
+  };
+}
+
+function clearActiveNewsWarm() {
+  if (!state.newsWarmTimer) return;
+  window.clearTimeout(state.newsWarmTimer);
+  state.newsWarmTimer = null;
+}
+
+function scheduleActiveNewsWarm(delayMs = 0, retryOnMiss = false) {
+  clearActiveNewsWarm();
+  state.newsWarmTimer = window.setTimeout(async () => {
+    state.newsWarmTimer = null;
+    const categoryId = state.newsCategory;
+    const result = await loadNewsCategory(categoryId, false);
+    if (!retryOnMiss || categoryId !== state.newsCategory) return;
+    const articleCount = result?.articles?.length ?? 0;
+    if (!articleCount || result?.status === "error" || result?.status === "restricted") {
+      scheduleActiveNewsWarm(20000, false);
+    }
+  }, Math.max(0, delayMs));
+}
+
 async function loadNewsCategory(catId, forceRefresh) {
   if (forceRefresh) {
     invalidateNewsCache();
@@ -6780,22 +7140,54 @@ async function loadNewsCategory(catId, forceRefresh) {
     if (catId !== state.newsCategory) return; // category switched mid-fetch
     state.newsArticles  = result.articles ?? [];
     state.newsLastFetched = result.fetchedAt ?? new Date();
+    syncNewsFeedState(result);
     setNewsUpdatedLabel(state.newsLastFetched);
-    renderNewsCards(state.newsArticles);
+    if (result.error && !state.newsArticles.length) renderNewsError(result.message || "News fetch failed.");
+    else renderNewsCards(state.newsArticles);
     updateCategoryCount(catId, state.newsArticles.length);
     updateBadge(state.newsArticles.length);
     if (state.newsCategory === catId) {
       setNewsTickerPool(state.newsArticles);
     }
+    renderFeedStatus();
+    renderTrustIndicators();
+    updateLiveMetrics();
+    return result;
   } catch (err) {
+    syncNewsFeedState({
+      status: "error",
+      message: err?.message ?? "News fetch failed",
+      articles: [],
+      fetchedAt: new Date()
+    });
+    renderFeedStatus();
+    renderTrustIndicators();
+    updateLiveMetrics();
     renderNewsError(`Fetch failed: ${err?.message ?? "Network error"}`);
+    return null;
   } finally {
     animateRefreshButton(false);
   }
 }
 
-async function prefetchAllCategories() {
+async function prefetchAllCategories(hydrateAll = false) {
   try {
+    if (!hydrateAll) {
+      const result = await fetchNewsCategory(state.newsCategory);
+      const articles = result.articles ?? [];
+      state.newsArticles = articles;
+      state.newsLastFetched = result.fetchedAt ?? new Date();
+      syncNewsFeedState(result);
+      updateCategoryCount(state.newsCategory, articles.length);
+      setNewsTickerPool(articles);
+      setNewsUpdatedLabel(state.newsLastFetched);
+      updateBadge(articles.length);
+      renderFeedStatus();
+      renderTrustIndicators();
+      updateLiveMetrics();
+      return result;
+    }
+
     const all = await fetchAllNewsCategories();
     const combinedPool = [];
     Object.entries(all).forEach(([catId, result]) => {
@@ -6807,13 +7199,19 @@ async function prefetchAllCategories() {
 
     // Seed default category
     const defaultResult = all[state.newsCategory];
-    if (defaultResult?.articles?.length) {
-      state.newsArticles   = defaultResult.articles;
-      state.newsLastFetched = defaultResult.fetchedAt;
+    if (defaultResult) {
+      state.newsArticles = defaultResult.articles ?? [];
+      state.newsLastFetched = defaultResult.fetchedAt ?? new Date();
+      syncNewsFeedState(defaultResult);
       setNewsUpdatedLabel(state.newsLastFetched);
       updateBadge(state.newsArticles.length);
+      renderFeedStatus();
+      renderTrustIndicators();
+      updateLiveMetrics();
     }
+    return defaultResult ?? null;
   } catch { /* silent — will load on open */ }
+  return null;
 }
 
 // ── Renderers ──────────────────────────────────────────────────────────────
@@ -7398,7 +7796,7 @@ function updateThreatLevel() {
 function updateThroughput() {
   if (!elements.throughputBars || !elements.throughputValue) return;
   // Simulate data flow based on active feeds
-  const feedCount = [state.liveFeeds.adsb, state.liveFeeds.ais].filter(f => f.status === "live").length;
+  const feedCount = [state.liveFeeds.adsb, state.liveFeeds.news, state.liveFeeds.ais].filter(f => f.status === "live").length;
   const base = feedCount * 1200 + Math.random() * 800;
   _throughputBytes = Math.max(0, Math.round(base + Math.random() * 400 - 200));
   const bars = elements.throughputBars.querySelectorAll(".throughput-bar");
@@ -7419,7 +7817,7 @@ function updateSignalIndicators() {
     el.classList.add(status === "live" ? "green" : status === "error" ? "red" : "amber");
   };
   setSignal(elements.sigAdsb, state.liveFeeds.adsb.status);
-  setSignal(elements.sigNews, state.newsLastFetched || state.newsArticles.length ? "live" : "pending");
+  setSignal(elements.sigNews, state.liveFeeds.news.status);
   setSignal(elements.sigAis, state.liveFeeds.ais.status);
 }
 
@@ -7522,6 +7920,7 @@ function renderPresencePeers(peers) {
 function updatePresenceIndicator() {
   const el = document.getElementById("presence-indicator");
   if (!el) return;
+  const enabled = isPresenceEnabled();
   const connected = isPresenceConnected();
   const peerCount = getPresencePeers().size;
   const online = navigator.onLine;
@@ -7529,6 +7928,8 @@ function updatePresenceIndicator() {
   el.classList.toggle("offline", !online);
   if (!online) {
     el.textContent = "NET COMMS: OFFLINE";
+  } else if (!enabled) {
+    el.textContent = "NET COMMS: OPTIONAL";
   } else {
     el.textContent = connected
       ? `NET COMMS: ${peerCount + 1} ACTIVE`
@@ -9227,16 +9628,23 @@ let _issTrailPositions = [];
 let _issTrailEntity = null;
 let _issTimer       = null;
 let _issLastData    = null;
+let _issSessionId   = 0;
 
 async function fetchISSPosition() {
-  const resp = await fetch("https://api.wheretheiss.at/v1/satellites/25544",
-    { signal: AbortSignal.timeout(6000) });
+  const result = await fetchWithOptionalLiveRelay({
+    relayPath: "iss",
+    directUrl: "https://api.wheretheiss.at/v1/satellites/25544",
+    timeoutMs: 6000
+  });
+  const resp = result?.response;
   if (!resp.ok) throw new Error("ISS fetch failed");
   return resp.json();
 }
 
 function initISSTracking() {
   if (!state.layers.iss) return;
+  if (_issEntity || _issTimer || viewer.entities.getById("iss-live")) return;
+  const sessionId = ++_issSessionId;
 
   // Create entity with a SampledPositionProperty for smooth interpolation
   const sampledPos = new Cesium.SampledPositionProperty();
@@ -9245,12 +9653,16 @@ function initISSTracking() {
     interpolationAlgorithm: Cesium.LagrangePolynomialApproximation
   });
 
+  const issPointColor = Cesium.Color.fromCssColorString("#60f7bf").withAlpha(0.96);
+  const issLabelColor = Cesium.Color.fromCssColorString("#60f7bf");
+  const issTrailColor = Cesium.Color.fromCssColorString("#60f7bf").withAlpha(0.3);
+
   _issEntity = viewer.entities.add({
     id: "iss-live",
     position: sampledPos,
     point: {
       pixelSize: 9,
-      color: Cesium.Color.fromCssColorString("#60f7bf"),
+      color: issPointColor,
       outlineColor: Cesium.Color.WHITE.withAlpha(0.8),
       outlineWidth: 1.5,
       disableDepthTestDistance: Number.POSITIVE_INFINITY
@@ -9258,7 +9670,7 @@ function initISSTracking() {
     label: {
       text: "ISS",
       font: '11px "Share Tech Mono", monospace',
-      fillColor: Cesium.Color.fromCssColorString("#60f7bf"),
+      fillColor: issLabelColor,
       outlineColor: Cesium.Color.BLACK.withAlpha(0.7),
       outlineWidth: 2,
       style: Cesium.LabelStyle.FILL_AND_OUTLINE,
@@ -9279,11 +9691,37 @@ function initISSTracking() {
     }
   });
   _issEntity._pulseSeed = Math.random() * Math.PI * 2;
+  _issEntity._basePixelSize = 9;
+  _issEntity._pointColor = issPointColor;
+
+  _issTrailEntity = viewer.entities.add({
+    id: "iss-live-trail",
+    polyline: {
+      positions: new Cesium.CallbackProperty(() => _issTrailPositions, false),
+      width: 1.35,
+      material: new Cesium.PolylineGlowMaterialProperty({
+        glowPower: 0.18,
+        color: new Cesium.CallbackProperty(() => issTrailColor, false)
+      }),
+      arcType: Cesium.ArcType.NONE
+    },
+    show: false,
+    properties: { layerId: "iss", entityType: "trail" }
+  });
+  _issTrailEntity._trailColor = issTrailColor;
+  _issTrailEntity._pulseSeed = _issEntity._pulseSeed;
 
   const poll = async () => {
-    if (!state.layers.iss) return;
+    if (!state.layers.iss || sessionId !== _issSessionId) {
+      _issTimer = null;
+      return;
+    }
     try {
       const d = await fetchISSPosition();
+      if (!state.layers.iss || sessionId !== _issSessionId) {
+        _issTimer = null;
+        return;
+      }
       _issLastData = d;
       const altM = (d.altitude ?? 408) * 1000;
       const pos  = Cesium.Cartesian3.fromDegrees(d.longitude, d.latitude, altM);
@@ -9292,27 +9730,19 @@ function initISSTracking() {
 
       // Update label with live telemetry
       if (_issEntity?.label) {
-        _issEntity.label.text = new Cesium.ConstantProperty(
-          `ISS  ${d.latitude.toFixed(1)}°  ${d.longitude.toFixed(1)}°  ${Math.round(d.altitude)}km`
-        );
+        const speedText = Number.isFinite(d.velocity) ? `${Math.round(d.velocity).toLocaleString()} km/h` : "Telemetry live";
+        _issEntity.label.text = `ISS  ${d.latitude.toFixed(1)}°  ${d.longitude.toFixed(1)}°\n${speedText}`;
       }
 
       // Trail — keep last 30 positions
       _issTrailPositions.push(pos);
       if (_issTrailPositions.length > 30) _issTrailPositions.shift();
-      if (_issTrailEntity) viewer.entities.remove(_issTrailEntity);
-      if (_issTrailPositions.length > 2) {
-        _issTrailEntity = viewer.entities.add({
-          polyline: {
-            positions: [..._issTrailPositions],
-            width: 1.2,
-            material: Cesium.Color.fromCssColorString("#60f7bf").withAlpha(0.35),
-            arcType: Cesium.ArcType.NONE
-          },
-          properties: { layerId: "iss", entityType: "trail" }
-        });
-      }
+      if (_issTrailEntity) _issTrailEntity.show = _issTrailPositions.length > 2 && state.layers.iss;
     } catch { /* silent — will retry */ }
+    if (!state.layers.iss || sessionId !== _issSessionId) {
+      _issTimer = null;
+      return;
+    }
     _issTimer = setTimeout(poll, 5000);
   };
 
@@ -9320,7 +9750,9 @@ function initISSTracking() {
 }
 
 function destroyISSTracking() {
+  _issSessionId += 1;
   if (_issTimer) clearTimeout(_issTimer);
+  _issTimer = null;
   if (_issEntity)      { viewer.entities.remove(_issEntity);      _issEntity      = null; }
   if (_issTrailEntity) { viewer.entities.remove(_issTrailEntity); _issTrailEntity = null; }
   _issTrailPositions = [];
@@ -9603,13 +10035,8 @@ const SIT_BRIEF_DURATION = 14000; // 14s auto-dismiss
 
 async function fetchTopGdeltStory() {
   try {
-    const resp = await fetch(
-      "https://api.gdeltproject.org/api/v2/doc/doc?query=(conflict OR military OR attack OR crisis OR war)&mode=artlist&maxrecords=5&timespan=6h&sort=DateDesc&format=json",
-      { signal: AbortSignal.timeout(8000) }
-    );
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const arts = data?.articles?.filter(a => a.title?.length > 25 && a.url);
+    const arts = (await gdeltDocFetch("(conflict OR military OR attack OR crisis OR war)", 5, "6h"))
+      ?.filter(a => a.title?.length > 25 && a.url);
     if (!arts?.length) return null;
     const art = arts[0];
     let domain = art.domain ?? "";

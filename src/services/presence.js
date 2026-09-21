@@ -13,6 +13,7 @@
  */
 
 const DEFAULT_WS_URL = "ws://localhost:4175";
+const PRESENCE_URL_KEY = "panopticon-earth-presence-url";
 const SEND_INTERVAL_MS = 2000;
 const RECONNECT_DELAY_MS = 5000;
 
@@ -31,18 +32,24 @@ const _peers = new Map();
 const _listeners = [];
 
 function wsUrl() {
-  // Allow the URL to be overridden via localStorage for deployment flexibility
+  // Presence is opt-in unless the operator explicitly enables the local server.
   try {
-    const custom = localStorage.getItem("panopticon-earth-presence-url");
+    const custom = localStorage.getItem(PRESENCE_URL_KEY)?.trim();
     if (custom) return custom;
   } catch { /* */ }
-  return DEFAULT_WS_URL;
+  return window.location.search.includes("presence=1") ? DEFAULT_WS_URL : "";
+}
+
+export function isPresenceEnabled() {
+  return !!wsUrl();
 }
 
 function connect() {
   if (_ws) return;
+  const targetUrl = wsUrl();
+  if (!targetUrl) return;
   try {
-    _ws = new WebSocket(wsUrl());
+    _ws = new WebSocket(targetUrl);
   } catch {
     scheduleReconnect();
     return;

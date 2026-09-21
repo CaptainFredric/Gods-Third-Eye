@@ -10,6 +10,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "vite build",
+    "stack": "node server/dev-stack.js",
+    "relay": "node server/live-proxy.js",
     "presence": "node server/presence.js"
   },
   "dependencies": {

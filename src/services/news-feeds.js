@@ -4,9 +4,12 @@
  * Returns normalised article objects with images, outlets, and metadata.
  */
 
+import { fetchWithOptionalLiveRelay, formatLiveRelayError, hasLiveRelay, isLikelyBrowserRestriction } from "./live-relay.js";
+
 const GDELT_BASE = "https://api.gdeltproject.org/api/v2/doc/doc";
 const FEED_TIMEOUT_MS = 9000;
 const CACHE_DURATION_MS = 90_000; // match default refresh cadence
+const DEFAULT_TIMESPAN = "48h";
 
 const _cache = new Map();
 
@@ -31,7 +34,7 @@ function dedupeArticles(articles) {
   });
 }
 
-function gdeltUrl(query, maxRecords = 12) {
+function gdeltUrl(query, maxRecords = 12, timespan = DEFAULT_TIMESPAN) {
   const params = new URLSearchParams({
     query,
     mode: "ArtList",
@@ -39,6 +42,7 @@ function gdeltUrl(query, maxRecords = 12) {
     maxrecords: String(maxRecords),
     sort: "DateDesc"
   });
+  if (timespan) params.set("timespan", timespan);
   return `${GDELT_BASE}?${params}`;
 }
 
@@ -93,29 +97,106 @@ function normalise(raw) {
   };
 }
 
-async function fetchGdelt(query, cacheKey, maxRecords = 12) {
+function buildResult({ articles = [], fromCache = false, fetchedAt = new Date(), status = "idle", message = "No recent stories returned", error = "", via = "direct" } = {}) {
+  return { articles, fromCache, fetchedAt, status, message, error, via };
+}
+
+async function fetchGdelt(query, cacheKey, maxRecords = 12, timespan = DEFAULT_TIMESPAN) {
   const now = Date.now();
   const cached = _cache.get(cacheKey);
   if (cached && now - cached.ts < CACHE_DURATION_MS) {
-    return { articles: cached.data, fromCache: true, fetchedAt: new Date(cached.ts) };
+    return buildResult({
+      articles: cached.data,
+      fromCache: true,
+      fetchedAt: new Date(cached.ts),
+      status: cached.data.length ? "live" : "idle",
+      message: cached.data.length ? `${cached.data.length} live intelligence stories` : "No recent stories returned",
+      via: "cache"
+    });
   }
 
-  const { signal, cancel } = timeoutSignal(FEED_TIMEOUT_MS);
   try {
-    const res = await fetch(gdeltUrl(query, maxRecords), {
-      headers: { Accept: "application/json" },
-      signal
+    const result = await fetchWithOptionalLiveRelay({
+      relayPath: "gdelt",
+      relayParams: {
+        query,
+        mode: "ArtList",
+        maxrecords: maxRecords,
+        timespan,
+        sort: "DateDesc"
+      },
+      directUrl: gdeltUrl(query, maxRecords, timespan),
+      timeoutMs: FEED_TIMEOUT_MS + 6000,
+      allowDirectFallback: !hasLiveRelay()
     });
-    cancel();
+    const res = result?.response;
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const payload = await res.json();
+    const relayMeta = payload?.relayMeta ?? null;
     const raw = Array.isArray(payload?.articles) ? payload.articles : [];
     const articles = dedupeArticles(raw.map(normalise).filter(Boolean));
     _cache.set(cacheKey, { data: articles, ts: now });
-    return { articles, fromCache: false, fetchedAt: new Date(now) };
+    const fetchedAt = relayMeta?.cachedAt ? new Date(relayMeta.cachedAt) : new Date(now);
+    const staleRelay = !!relayMeta?.stale;
+    const cachedRelay = !!relayMeta?.cached;
+    return buildResult({
+      articles,
+      fromCache: false,
+      fetchedAt: Number.isNaN(fetchedAt.getTime()) ? new Date(now) : fetchedAt,
+      status: staleRelay ? "restricted" : articles.length ? "live" : "idle",
+      message: staleRelay
+        ? (relayMeta?.warning || `Serving ${articles.length} stories from relay cache while GDELT upstream cools down.`)
+        : cachedRelay
+          ? (articles.length ? `${articles.length} intelligence stories via relay cache` : "No recent stories in relay cache")
+          : (articles.length ? `${articles.length} live intelligence stories` : "No recent stories returned"),
+      via: relayMeta?.source || result?.via || "direct"
+    });
   } catch (error) {
-    cancel();
-    return { articles: [], error: error?.message || "Failed", fromCache: false, fetchedAt: new Date() };
+    if (cached?.data?.length) {
+      const restricted = isLikelyBrowserRestriction(error);
+      return buildResult({
+        articles: cached.data,
+        fromCache: true,
+        fetchedAt: new Date(cached.ts),
+        status: restricted ? "restricted" : "error",
+        message: restricted
+          ? "Serving cached intelligence snapshot while direct GDELT access stays restricted."
+          : "Serving cached intelligence snapshot while GDELT catches up.",
+        error: error?.message || "Failed",
+        via: "cache"
+      });
+    }
+
+    if (hasLiveRelay()) {
+      return buildResult({
+        status: "error",
+        message: formatLiveRelayError(error, "Configured relay is unavailable."),
+        error: error?.message || "Failed",
+        fetchedAt: new Date()
+      });
+    }
+
+    if (isLikelyBrowserRestriction(error)) {
+      return buildResult({
+        status: "restricted",
+        message: hasLiveRelay()
+          ? "Configured relay is unavailable and direct browser access to GDELT is blocked here."
+          : "Direct browser access to GDELT is blocked here. Add a live relay to restore intelligence updates.",
+        error: error?.message || "Failed",
+        fetchedAt: new Date()
+      });
+    }
+
+    return buildResult({
+      status: "error",
+      message: error?.message?.includes("429")
+        ? "GDELT rate limit reached. Holding until the next refresh window."
+        : error?.name === "AbortError"
+          ? "GDELT timed out. Holding until the next refresh window."
+          : "GDELT is temporarily unavailable.",
+      error: error?.message || "Failed",
+      fetchedAt: new Date()
+    });
   }
 }
 
@@ -171,14 +252,11 @@ export async function fetchNewsCategory(categoryId) {
 }
 
 export async function fetchAllNewsCategories() {
-  const results = await Promise.all(
-    NEWS_CATEGORIES.map(cat =>
-      fetchGdelt(cat.query, `cat:${cat.id}`, cat.maxRecords).then(res => ({
-        categoryId: cat.id,
-        ...res
-      }))
-    )
-  );
+  const results = [];
+  for (const cat of NEWS_CATEGORIES) {
+    const result = await fetchGdelt(cat.query, `cat:${cat.id}`, cat.maxRecords);
+    results.push({ categoryId: cat.id, ...result });
+  }
   return Object.fromEntries(results.map(r => [r.categoryId, r]));
 }
 

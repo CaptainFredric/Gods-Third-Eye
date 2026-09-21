@@ -1,3 +1,5 @@
+import { fetchWithOptionalLiveRelay, formatLiveRelayError, hasLiveRelay, isLikelyBrowserRestriction } from "./live-relay.js";
+
 const ADSB_URL = "https://opensky-network.org/api/states/all";
 const AIS_STORAGE_KEY = "panopticon-earth-ais-endpoint";
 const FEED_TIMEOUT_MS = 8000;
@@ -87,13 +89,15 @@ export async function fetchLiveFeeds() {
 }
 
 export async function fetchAdsbFeed() {
-  const { signal, cancel } = timeoutSignal(FEED_TIMEOUT_MS);
+  const relayPreferred = hasLiveRelay();
   try {
-    const response = await fetch(ADSB_URL, {
-      headers: { Accept: "application/json" },
-      signal
+    const result = await fetchWithOptionalLiveRelay({
+      relayPath: "adsb",
+      directUrl: ADSB_URL,
+      timeoutMs: FEED_TIMEOUT_MS,
+      allowDirectFallback: !relayPreferred
     });
-    cancel();
+    const response = result?.response;
     if (!response.ok) {
       return withStatusError("OpenSky", `HTTP ${response.status}`);
     }
@@ -107,7 +111,26 @@ export async function fetchAdsbFeed() {
       updatedAt: new Date().toISOString()
     };
   } catch (error) {
-    cancel();
+    if (relayPreferred) {
+      return {
+        status: "error",
+        source: "OpenSky ADS-B",
+        message: formatLiveRelayError(error, "Configured relay is unavailable."),
+        records: [],
+        updatedAt: new Date().toISOString()
+      };
+    }
+    if (error?.name !== "AbortError" && isLikelyBrowserRestriction(error)) {
+      return {
+        status: "restricted",
+        source: "OpenSky ADS-B",
+        message: hasLiveRelay()
+          ? "Configured relay is unavailable and direct browser access to OpenSky is blocked here. Scenario air traffic remains available."
+          : "Direct browser access to OpenSky is blocked here. Add a live relay to restore aircraft tracking.",
+        records: [],
+        updatedAt: new Date().toISOString()
+      };
+    }
     return withStatusError("OpenSky ADS-B", error?.name === "AbortError" ? "Timed out" : error?.message ?? "Request failed");
   }
 }

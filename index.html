@@ -830,6 +830,13 @@
 
       <section class="metric-cluster" id="metric-cluster"></section>
 
+      <section class="layers-quick-actions" aria-label="Quick actions">
+        <button id="layers-hotspot" class="panel-btn primary" type="button">Hotspot</button>
+        <button id="layers-random" class="panel-btn" type="button">Random</button>
+        <button id="layers-news" class="panel-btn" type="button">News</button>
+        <button id="layers-guide" class="panel-btn" type="button">Guide</button>
+      </section>
+
       <section class="control-group">
         <h3>Basemap</h3>
         <div id="basemap-buttons" class="pill-row"></div>
@@ -919,8 +926,17 @@
 
       <section class="control-group">
         <h3>Live Feeds</h3>
+        <div id="feed-transport" class="feed-transport"></div>
         <div id="feed-status" class="feed-status"></div>
         <div class="feed-settings">
+          <label for="live-relay-endpoint" class="feed-label">Live Relay (recommended)</label>
+          <input id="live-relay-endpoint" class="feed-input" type="url" placeholder="http://127.0.0.1:4180/api/live" autocomplete="off" />
+          <div class="feed-actions">
+            <button id="use-local-relay" class="panel-btn" type="button">Use Local</button>
+            <button id="use-hosted-relay" class="panel-btn" type="button">Use /api/live</button>
+            <button id="save-live-relay" class="panel-btn primary" type="button">Save Relay</button>
+            <button id="clear-live-relay" class="panel-btn" type="button">Clear Relay</button>
+          </div>
           <label for="ais-endpoint" class="feed-label">AIS Endpoint (optional)</label>
           <input id="ais-endpoint" class="feed-input" type="url" placeholder="https://example.com/ais.json" autocomplete="off" />
           <div class="feed-actions">
