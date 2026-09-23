@@ -718,7 +718,7 @@
   </div>
 
   <div id="app">
-    <div id="classification-bar" class="classification-bar" aria-hidden="true">UNCLASSIFIED // OPEN SOURCE INTELLIGENCE // PANOPTICON-EARTH v2.0 // ALL FEEDS ACTIVE</div>
+    <div id="classification-bar" class="classification-bar" aria-hidden="true">UNCLASSIFIED // OPEN SOURCE INTELLIGENCE // PANOPTICON-EARTH v2.0 // FEED STATUS: INITIALIZING</div>
     <div id="cesiumContainer"></div>
     <div class="ambient-scanline" aria-hidden="true"></div>
     <div class="data-pulse-ring" aria-hidden="true"></div>
@@ -1057,6 +1057,7 @@
           <span class="footer-signal"><span class="footer-signal-icon green" id="sig-adsb"></span>ADS-B</span>
           <span class="footer-signal"><span class="footer-signal-icon green" id="sig-news"></span>NEWS</span>
           <span class="footer-signal"><span class="footer-signal-icon amber" id="sig-ais"></span>AIS</span>
+          <span class="footer-signal"><span class="footer-signal-icon amber" id="sig-iss"></span>ISS</span>
         </div>
         <button id="refresh-now" class="transport-btn" type="button">Refresh Now</button>
         <button id="btn-fullscreen" class="transport-btn" type="button">Fullscreen</button>
@@ -1161,9 +1162,9 @@
   <aside id="news-briefing" class="news-briefing glass-panel hidden" aria-label="Live News Briefing">
     <div class="news-head">
       <div class="news-head-left">
-        <span class="news-live-dot"></span>
-        <span class="news-title">LIVE INTELLIGENCE FEED</span>
-        <span class="news-live-badge" aria-label="Live">LIVE</span>
+        <span id="news-live-dot" class="news-live-dot"></span>
+        <span id="news-title" class="news-title">LIVE INTELLIGENCE FEED</span>
+        <span id="news-live-badge" class="news-live-badge" aria-label="Live">LIVE</span>
       </div>
       <div class="news-head-right">
         <span id="news-updated" class="news-updated-label">Fetching…</span>
@@ -1615,13 +1616,13 @@
       <div class="support-card-row">
         <span class="support-card-glyph">◈</span>
         <span class="support-card-title">God's Third Eye</span>
-        <span class="support-card-live">LIVE</span>
+        <span class="support-card-live">OPEN</span>
       </div>
       <p class="support-card-copy">Free, open-source OSINT. No ads, no paywall. If this keeps your feeds running, a coffee keeps mine going.</p>
       <div class="support-card-stats">
         <span><strong id="sc-entities">—</strong> entities tracked</span>
-        <span><strong>5</strong> live feeds</span>
-        <span><strong>24/7</strong> uptime</span>
+        <span><strong>Multi</strong> source feeds</span>
+        <span><strong>Browser</strong> local runtime</span>
       </div>
       <div class="support-card-cta">Support the mission →</div>
     </div>
